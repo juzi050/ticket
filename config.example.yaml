@@ -1,0 +1,126 @@
+application:
+  log_level: INFO
+  database_path: data/ticket_monitor.db
+  timezone: Asia/Shanghai
+  mock_mode: false
+
+browser:
+  headless: false
+  channel: msedge
+  executable_path:
+  page_timeout_seconds: 30
+  close_after_login: true
+
+login:
+  timeout_seconds: 600
+  retry_interval_seconds: 300
+  check_interval_seconds: 2
+  auto_open_login_page: true
+
+notification:
+  enabled: true
+  provider: console
+  max_retries: 3
+  retry_interval_seconds: 5
+
+monitor:
+  default_interval_seconds: 10
+  random_delay_min_seconds: 1
+  random_delay_max_seconds: 3
+  max_consecutive_errors: 5
+  lock_cooldown_seconds: 60
+
+# 只有确认了真实页面标记后才填写。选择器采用 Playwright locator 语法。
+platforms:
+  piaoniu:
+    home_url: https://www.piaoniu.com/
+    login_trigger_text: 登录
+    authenticated_selectors:
+      - "text=退出登录"
+    unauthenticated_selectors:
+      - "text=登录"
+  motianlun:
+    home_url: https://m.motianlun.cn/
+    authenticated_selectors: []
+    unauthenticated_selectors: []
+
+tasks:
+  - task_id: piaoniu_001
+    enabled: true
+    platform: piaoniu
+    event_name: 示例演唱会
+    event_url: https://www.piaoniu.com/example
+    event_id: ""
+    target_sessions:
+      - "2026-08-01 19:30"
+    target_ticket_levels:
+      - "1280"
+      - "1580"
+    target_areas:
+      - 内场A区
+      - 内场B区
+    target_stands: []
+    target_seat_positions: []
+    excluded_keywords:
+      - 视线不良
+      - 遮挡
+      - 站票
+      - 随机座
+    area_regexes: []
+    match_mode: contains
+    area_priorities:
+      内场A区: 1
+      内场B区: 2
+    row_min: 1
+    row_max: 10
+    quantity: 2
+    adjacent_seats_required: true
+    max_unit_price: 1200
+    max_total_price: 2400
+    interval_seconds: 10
+    auto_lock: true
+    notify: true
+    stop_after_lock_success: true
+    max_lock_attempts: 1
+
+  - task_id: piaoniu_002
+    enabled: true
+    platform: piaoniu
+    event_name: 示例演唱会第二场
+    event_url: https://www.piaoniu.com/example2
+    target_sessions:
+      - "2026-08-02 19:30"
+    target_ticket_levels:
+      - "880"
+    target_areas:
+      - 一层正面看台
+    quantity: 1
+    adjacent_seats_required: false
+    max_unit_price: 800
+    max_total_price: 800
+    interval_seconds: 15
+    auto_lock: false
+    notify: true
+
+  - task_id: motianlun_001
+    enabled: true
+    platform: motianlun
+    event_name: 示例音乐节
+    event_url: https://m.motianlun.cn/example
+    event_id: ""
+    target_sessions:
+      - "2026-09-01"
+    target_ticket_levels:
+      - VIP
+      - 普通票
+    target_areas:
+      - VIP区
+    quantity: 2
+    adjacent_seats_required: false
+    max_unit_price: 600
+    max_total_price: 1200
+    interval_seconds: 12
+    auto_lock: true
+    notify: true
+    stop_after_lock_success: true
+    max_lock_attempts: 1

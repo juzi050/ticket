@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.env
+config.yaml
+data/*.db
+data/*.db-*
+data/browser_states/*
+data/browser_profiles/*
+logs/*.log*
+output/playwright/
+!data/browser_states/.gitkeep
+!data/browser_profiles/.gitkeep
