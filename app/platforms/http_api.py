@@ -58,10 +58,15 @@ class TicketPlatformApi(ABC):
             response = await self.client.request(
                 method, url, params=params, json=json_body
             )
-            try:
-                body = response.json()
-            except ValueError as exc:
-                raise PlatformApiError("平台返回了非 JSON 响应") from exc
+            is_json = "json" in response.headers.get("content-type", "").lower()
+            if is_json:
+                try:
+                    body = response.json()
+                except ValueError:
+                    body = response.text
+                    is_json = False
+            else:
+                body = response.text
             await self.audit.append(
                 AuditEntry(
                     level="INFO" if response.is_success else "ERROR",
@@ -83,6 +88,8 @@ class TicketPlatformApi(ABC):
                     await self.sessions.mark_expired(self.platform)
                 raise PlatformAuthExpiredError("登录状态已失效，请重新登录")
             response.raise_for_status()
+            if not is_json:
+                raise PlatformApiError("平台返回了非 JSON 响应")
             return body
         except PlatformApiError:
             raise

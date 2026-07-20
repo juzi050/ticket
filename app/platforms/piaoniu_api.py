@@ -17,7 +17,11 @@ from app.domain import (
     TicketOption,
 )
 from app.platform_url import detect_platform, normalize_event_url
-from app.platforms.http_api import PlatformCapabilityUnavailable, TicketPlatformApi
+from app.platforms.http_api import (
+    PlatformAuthExpiredError,
+    PlatformCapabilityUnavailable,
+    TicketPlatformApi,
+)
 
 
 BASE_URL = "https://www.piaoniu.com"
@@ -113,7 +117,16 @@ class PiaoniuApi(TicketPlatformApi):
         self._session_cache: dict[tuple[str, str], SessionInfo] = {}
 
     async def check_auth(self) -> bool:
-        return False
+        try:
+            payload = await self._request_json(
+                "GET",
+                f"{BASE_URL}/api/v1/user",
+                action="check_auth",
+                requires_auth=True,
+            )
+        except PlatformAuthExpiredError:
+            return False
+        return isinstance(payload, dict) and bool(payload)
 
     async def get_event(self, event_url: str) -> EventInfo:
         activity_id = _activity_id(event_url)

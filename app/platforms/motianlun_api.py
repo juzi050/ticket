@@ -121,7 +121,17 @@ class MotianlunApi(TicketPlatformApi):
         self._session_cache: dict[tuple[str, str], SessionInfo] = {}
 
     async def check_auth(self) -> bool:
-        return False
+        payload = await self._request_json(
+            "GET",
+            f"{BASE_URL}/userapi/user/000/info",
+            action="check_auth",
+            params=_common_params(),
+            requires_auth=True,
+        )
+        authenticated = payload.get("statusCode") == 200
+        if not authenticated and payload.get("statusCode") == 1005 and self.sessions:
+            await self.sessions.mark_expired(self.platform)
+        return authenticated
 
     async def get_event(self, event_url: str) -> EventInfo:
         show_id = _show_id(event_url)

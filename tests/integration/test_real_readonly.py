@@ -37,6 +37,24 @@ async def test_real_piaoniu_event(tmp_path) -> None:
     assert exact is not None and exact.listing_id == tickets[0].listing_id
 
 
+async def test_real_platform_auth_endpoints_reject_anonymous_sessions(tmp_path) -> None:
+    database = MvpDatabase(tmp_path / "ticket.db")
+    await database.initialize()
+    audit = AuditRepository(database)
+    piaoniu = PiaoniuApi(
+        httpx.AsyncClient(headers={"User-Agent": "Mozilla/5.0"}, timeout=20), audit
+    )
+    motianlun = MotianlunApi(
+        httpx.AsyncClient(headers={"User-Agent": "Mozilla/5.0"}, timeout=20), audit
+    )
+    try:
+        assert await piaoniu.check_auth() is False
+        assert await motianlun.check_auth() is False
+    finally:
+        await piaoniu.close()
+        await motianlun.close()
+
+
 async def test_real_motianlun_event(tmp_path) -> None:
     database = MvpDatabase(tmp_path / "ticket.db")
     await database.initialize()
