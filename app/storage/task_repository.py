@@ -93,6 +93,24 @@ class TaskRepository:
             )
             await connection.commit()
 
+    async def set_next_check_at(
+        self, task_id: str, next_check_at: datetime | None
+    ) -> None:
+        async with self.database.connect() as connection:
+            await connection.execute(
+                """
+                UPDATE monitor_tasks
+                SET next_check_at=?, updated_at=?
+                WHERE task_id=?
+                """,
+                (
+                    next_check_at.isoformat() if next_check_at else None,
+                    utc_now().isoformat(),
+                    task_id,
+                ),
+            )
+            await connection.commit()
+
     async def update_runtime(
         self,
         task_id: str,
