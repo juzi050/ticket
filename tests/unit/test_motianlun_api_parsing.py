@@ -5,6 +5,7 @@ import httpx
 import pytest
 
 from app.domain import BuyerProfile, TicketOption
+from app.domain import MonitorTask, OrderResult
 from app.platforms.motianlun_api import (
     MotianlunApi,
     _create_order_body,
@@ -161,6 +162,144 @@ async def test_get_exact_ticket_uses_ticket_detail_instead_of_random_listing() -
     request = api._request_json.await_args
     assert request.kwargs["action"] == "get_exact_ticket"
     assert request.kwargs["json_body"] == {"id": "ticket-1"}
+
+
+@pytest.mark.asyncio
+async def test_create_order_reads_nested_result_data() -> None:
+    preview = order_preview()
+    pending = OrderResult(
+        success=True,
+        status="payment_pending",
+        order_id="order-1",
+        final_total=Decimal("1108.8"),
+        message="待支付",
+    )
+    api = MotianlunApi(httpx.AsyncClient(), Mock())
+    api._request_json = AsyncMock(
+        return_value={
+            "statusCode": 200,
+            "data": None,
+            "result": {"data": {"orderOID": "order-1"}},
+        }
+    )
+    api.get_order_detail = AsyncMock(return_value=pending)
+
+    try:
+        result = await api.create_order(preview)
+    finally:
+        await api.close()
+
+    assert result.order_id == "order-1"
+    api.get_order_detail.assert_awaited_once_with("order-1")
+
+
+@pytest.mark.asyncio
+async def test_order_detail_reads_nested_reserve_time() -> None:
+    api = MotianlunApi(httpx.AsyncClient(), Mock())
+    api._request_json = AsyncMock(
+        side_effect=[
+            {
+                "statusCode": 200,
+                "data": {
+                    "orderOID": "order-1",
+                    "orderStatus": {"name": "Unpaid"},
+                    "unPaidTransactionIds": ["transaction-1"],
+                    "total": 1108.8,
+                },
+            },
+            {
+                "statusCode": 200,
+                "data": None,
+                "result": {"time": 300000},
+            },
+        ]
+    )
+
+    try:
+        result = await api.get_order_detail("order-1")
+    finally:
+        await api.close()
+
+    assert result.status == "payment_pending"
+    assert result.payment_deadline is not None
+
+
+@pytest.mark.asyncio
+async def test_recent_order_matches_stable_fields_without_listing_id() -> None:
+    current = exact_ticket().model_copy(
+        update={"seat_description": "随机座位 / 票品提供 测试商家"}
+    )
+    task = MonitorTask(
+        ticket=current,
+        quantity=1,
+        buyer_ids=["buyer-1"],
+        ideal_price=Decimal("3000"),
+    )
+    pending = OrderResult(
+        success=True,
+        status="payment_pending",
+        order_id="order-1",
+        message="待支付",
+        raw_data={
+            "showOID": "show-1",
+            "showSessionOID": "session-1",
+            "seatPlanOID": "plan-1",
+            "price": 1056.0,
+            "items": [{"qty": 1, "ticket": {"sellerName": "测试商家"}}],
+        },
+    )
+    api = MotianlunApi(httpx.AsyncClient(), Mock())
+    api._request_json = AsyncMock(
+        return_value={
+            "statusCode": 200,
+            "data": [{"orderOID": "order-1"}],
+        }
+    )
+    api.get_order_detail = AsyncMock(return_value=pending)
+
+    try:
+        result = await api.find_recent_order(task)
+    finally:
+        await api.close()
+
+    assert result == pending
+
+
+def order_preview():
+    from app.domain import OrderPreview
+
+    return OrderPreview(
+        platform="motianlun",
+        preview_id="preview-token",
+        event_id="show-1",
+        session_id="session-1",
+        listing_id="ticket-1",
+        quantity=1,
+        buyer_ids=["buyer-1"],
+        remote_buyer_ids=["audience-1"],
+        unit_price=Decimal("1056"),
+        ticket_total=Decimal("1056"),
+        fee_total=Decimal("52.8"),
+        final_total=Decimal("1108.8"),
+        raw_data={
+            "detail": {
+                "seatPlan": {"seatPlanId": "plan-1"},
+                "ticket": {"ticketId": "ticket-1"},
+            },
+            "preorder": {
+                "agreement": {"orderAgreementOID": "agreement-1"},
+                "ticketChecksumToken": "checksum-1",
+                "transactionId": "transaction-1",
+                "memberLevel": {"name": "NORMAL"},
+                "audienceSize": 1,
+            },
+            "fee_items": [
+                {"itemType": "TICKET_PRICE", "amount": 1056},
+                {"itemType": "SERVICE_FEE", "amount": 52.8},
+            ],
+            "delivery": {"code": 5, "name": "E_TICKET"},
+        },
+    )
 
 
 def test_matches_remote_audience_by_exact_identity() -> None:

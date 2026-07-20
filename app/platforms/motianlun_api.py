@@ -688,7 +688,11 @@ class MotianlunApi(TicketPlatformApi):
             json_body=body,
             requires_auth=True,
         )
-        data = dict(_business_data(payload, "创建订单") or {})
+        data = _business_data(payload, "创建订单")
+        if not data:
+            result_payload = payload.get("result") or {}
+            data = result_payload.get("data") if isinstance(result_payload, dict) else {}
+        data = dict(data or {})
         order_id = str(data.get("orderOID") or "")
         if not order_id:
             raise PlatformApiError("摩天轮创建订单成功响应中缺少订单号")
@@ -732,7 +736,10 @@ class MotianlunApi(TicketPlatformApi):
                 },
                 requires_auth=True,
             )
-            reserve_data = _business_data(reserve_payload, "查询支付截止时间") or {}
+            reserve_data = _business_data(reserve_payload, "查询支付截止时间")
+            if not reserve_data:
+                result_payload = reserve_payload.get("result") or {}
+                reserve_data = result_payload if isinstance(result_payload, dict) else {}
             deadline = _deadline_from_reserve_time(reserve_data.get("time"))
         final_total = _decimal_field(
             data, "total", "totalPrice", "payTotal", "orderPrice", "price"
@@ -768,11 +775,17 @@ class MotianlunApi(TicketPlatformApi):
             candidates = data.get("list") or data.get("orderList") or []
         else:
             candidates = data or []
-        required_values = {
-            task.ticket.event_id,
-            task.ticket.session_id,
-            task.ticket.listing_id,
-        }
+        required_values = {task.ticket.event_id, task.ticket.session_id}
+        if task.ticket.ticket_group_id:
+            required_values.add(task.ticket.ticket_group_id)
+        expected_seller = next(
+            (
+                part.removeprefix("票品提供 ")
+                for part in (task.ticket.seat_description or "").split(" / ")
+                if part.startswith("票品提供 ")
+            ),
+            None,
+        )
         for candidate in candidates:
             order_id = str(
                 candidate.get("orderId") or candidate.get("orderOID") or ""
@@ -780,6 +793,18 @@ class MotianlunApi(TicketPlatformApi):
             if not order_id:
                 continue
             detail = await self.get_order_detail(order_id)
-            if required_values.issubset(_all_scalar_values(detail.raw_data)):
-                return detail
+            if not required_values.issubset(_all_scalar_values(detail.raw_data)):
+                continue
+            if _decimal_field(detail.raw_data, "price") != task.ticket.unit_price:
+                continue
+            items = list(detail.raw_data.get("items") or [])
+            if sum(int(item.get("qty") or 0) for item in items) != task.quantity:
+                continue
+            seller_names = {
+                str((item.get("ticket") or {}).get("sellerName") or "")
+                for item in items
+            }
+            if expected_seller and expected_seller not in seller_names:
+                continue
+            return detail
         return None
