@@ -2,7 +2,10 @@ from decimal import Decimal
 
 from app.domain import BuyerProfile
 from app.platforms.motianlun_api import (
+    _create_order_body,
+    _deadline_from_reserve_time,
     _matching_audience,
+    _order_status,
     _price_totals,
     _show_id,
     parse_event,
@@ -103,3 +106,56 @@ def test_calculates_final_total_from_official_fee_items() -> None:
     assert ticket_total == Decimal("1056")
     assert fee_total == Decimal("42.8")
     assert final_total == Decimal("1098.8")
+
+
+def test_builds_verified_create_order_body() -> None:
+    from app.domain import OrderPreview
+
+    preview = OrderPreview(
+        platform="motianlun",
+        preview_id="preview-token",
+        event_id="show-1",
+        session_id="session-1",
+        listing_id="ticket-1",
+        quantity=1,
+        buyer_ids=["buyer-1"],
+        remote_buyer_ids=["audience-1"],
+        unit_price=Decimal("1056"),
+        ticket_total=Decimal("1056"),
+        fee_total=Decimal("52.8"),
+        final_total=Decimal("1108.8"),
+        raw_data={
+            "detail": {
+                "seatPlan": {"seatPlanId": "plan-1"},
+                "ticket": {"ticketId": "ticket-1"},
+            },
+            "preorder": {
+                "agreement": {"orderAgreementOID": "agreement-1"},
+                "ticketChecksumToken": "checksum-1",
+                "transactionId": "transaction-1",
+                "memberLevel": {"name": "NORMAL"},
+                "audienceSize": 1,
+            },
+            "fee_items": [
+                {"itemType": "TICKET_PRICE", "amount": 1056},
+                {"itemType": "SERVICE_FEE", "amount": 52.8},
+            ],
+            "delivery": {"code": 5, "name": "E_TICKET"},
+        },
+    )
+
+    body = _create_order_body(preview)
+
+    assert body["ticketOID"] == "ticket-1"
+    assert body["total"] == 1108.8
+    assert body["audienceIdList"] == ["audience-1"]
+    assert body["priceItemsV2"][1]["amount"] == 52.8
+
+
+def test_maps_pending_status_and_countdown_deadline() -> None:
+    from app.domain import utc_now
+
+    assert _order_status({"name": "Unpaid"}) == "payment_pending"
+    deadline = _deadline_from_reserve_time(300)
+    assert deadline is not None
+    assert 295 <= (deadline - utc_now()).total_seconds() <= 300

@@ -186,6 +186,116 @@ def _price_totals(items: list[dict[str, Any]]) -> tuple[Decimal, Decimal, Decima
     return ticket_total, total - ticket_total, total
 
 
+def _create_order_body(preview: OrderPreview) -> dict[str, Any]:
+    raw = preview.raw_data
+    detail = raw["detail"]
+    preorder = raw["preorder"]
+    fee_items = raw["fee_items"]
+    delivery = raw["delivery"]
+    seat_plan = detail["seatPlan"]
+    ticket = detail["ticket"]
+    ticket_fee = next(
+        (item for item in fee_items if item.get("itemType") == "TICKET_PRICE"),
+        None,
+    )
+    required = {
+        "token": preview.preview_id,
+        "agreement": (preorder.get("agreement") or {}).get("orderAgreementOID"),
+        "ticket_checksum": preorder.get("ticketChecksumToken"),
+        "transaction": preorder.get("transactionId"),
+        "delivery": delivery.get("code"),
+        "ticket_price": ticket_fee.get("amount") if ticket_fee else None,
+    }
+    missing = [name for name, value in required.items() if value in {None, ""}]
+    if missing:
+        raise PlatformApiError(f"订单预览缺少创建字段：{', '.join(missing)}")
+    body: dict[str, Any] = {
+        "token": preview.preview_id,
+        "locationCityOID": "3301",
+        "showId": preview.event_id,
+        "sessionId": preview.session_id,
+        "seatPlanId": seat_plan["seatPlanId"],
+        "ticketOID": ticket["ticketId"],
+        "user": "000",
+        "qty": preview.quantity,
+        "price": ticket_fee["amount"],
+        "total": float(preview.final_total),
+        "compensatedPrice": 0,
+        "orderAgreementOID": required["agreement"],
+        "priceItemsV2": [
+            {"itemType": item["itemType"], "amount": item["amount"]}
+            for item in fee_items
+        ],
+        "deliverMethodCode": required["delivery"],
+        "adjacentSeat": True,
+        "ticketChecksumToken": required["ticket_checksum"],
+        "transactionId": required["transaction"],
+        "memberLevel": (preorder.get("memberLevel") or {}).get("name"),
+    }
+    if int(preorder.get("audienceSize") or 0) > 0:
+        body["audienceIdList"] = preview.remote_buyer_ids
+    return body
+
+
+def _payment_url(order_id: str) -> str:
+    return (
+        "https://m.motianlun.cn/package-order/order-detail/order-detail"
+        f"?orderOID={order_id}"
+    )
+
+
+def _order_status(value: Any) -> str:
+    if isinstance(value, dict):
+        value = value.get("name")
+    normalized = str(value or "").lower()
+    if normalized in {"unpaid", "paying"}:
+        return "payment_pending"
+    if normalized == "succeeded":
+        return "success"
+    if normalized in {"canceled", "failed", "refunded"}:
+        return "failed"
+    return normalized or "unknown"
+
+
+def _decimal_field(data: dict[str, Any], *names: str) -> Decimal | None:
+    for name in names:
+        value = data.get(name)
+        if value is not None and not isinstance(value, (dict, list)):
+            try:
+                return Decimal(str(value))
+            except Exception:
+                pass
+    return None
+
+
+def _deadline_from_reserve_time(value: Any) -> datetime | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number <= 0:
+        return None
+    if number > 10_000_000_000:
+        return datetime.fromtimestamp(number / 1000, tz=timezone.utc)
+    if number > 1_000_000_000:
+        return datetime.fromtimestamp(number, tz=timezone.utc)
+    return datetime.now(timezone.utc) + timedelta(seconds=number)
+
+
+def _all_scalar_values(value: Any) -> set[str]:
+    if isinstance(value, dict):
+        result: set[str] = set()
+        for item in value.values():
+            result.update(_all_scalar_values(item))
+        return result
+    if isinstance(value, list):
+        result = set()
+        for item in value:
+            result.update(_all_scalar_values(item))
+        return result
+    return {str(value)}
+
+
 class MotianlunApi(TicketPlatformApi):
     platform = "motianlun"
 
@@ -516,10 +626,107 @@ class MotianlunApi(TicketPlatformApi):
         )
 
     async def create_order(self, preview: OrderPreview) -> OrderResult:
-        raise PlatformCapabilityUnavailable("摩天轮创建订单 API 尚未完成登录后验证")
+        body = _create_order_body(preview)
+        payload = await self._request_json(
+            "POST",
+            f"{BASE_URL}/orderapi/buyer/order/v4/create",
+            action="create_order",
+            params={**_common_params(), "token": preview.preview_id},
+            json_body=body,
+            requires_auth=True,
+        )
+        data = dict(_business_data(payload, "创建订单") or {})
+        order_id = str(data.get("orderOID") or "")
+        if not order_id:
+            raise PlatformApiError("摩天轮创建订单成功响应中缺少订单号")
+        detail = await self.get_order_detail(order_id)
+        if detail.status != "payment_pending":
+            raise PlatformApiError(f"真实订单状态不是待支付：{detail.status}")
+        return detail.model_copy(
+            update={
+                "success": True,
+                "final_total": detail.final_total or preview.final_total,
+                "payment_url": detail.payment_url or _payment_url(order_id),
+                "message": "真实待支付订单创建成功",
+                "raw_data": {"create": data, "detail": detail.raw_data},
+            }
+        )
 
     async def get_order_detail(self, order_id: str) -> OrderResult:
-        raise PlatformCapabilityUnavailable("摩天轮订单详情 API 尚未完成登录后验证")
+        payload = await self._request_json(
+            "POST",
+            f"{BASE_URL}/orderapi/buyer/order_base/v1/get_detail_by_id",
+            action="get_order_detail",
+            params=_common_params(),
+            json_body={"orderId": order_id},
+            requires_auth=True,
+        )
+        data = dict(_business_data(payload, "查询订单详情") or {})
+        actual_order_id = str(
+            data.get("orderId") or data.get("orderOID") or order_id
+        )
+        status = _order_status(data.get("orderStatus"))
+        transaction_ids = list(data.get("unPaidTransactionIds") or [])
+        deadline = None
+        if status == "payment_pending" and transaction_ids:
+            reserve_payload = await self._request_json(
+                "GET",
+                f"{BASE_URL}/orderapi/order/reserve_time",
+                action="get_payment_deadline",
+                params={
+                    **_common_params(),
+                    "transactionOID": transaction_ids[0],
+                },
+                requires_auth=True,
+            )
+            reserve_data = _business_data(reserve_payload, "查询支付截止时间") or {}
+            deadline = _deadline_from_reserve_time(reserve_data.get("time"))
+        final_total = _decimal_field(
+            data, "total", "totalPrice", "payTotal", "orderPrice", "price"
+        )
+        return OrderResult(
+            success=status in {"payment_pending", "success"},
+            status=status,
+            order_id=actual_order_id,
+            final_total=final_total,
+            payment_deadline=deadline,
+            payment_url=_payment_url(actual_order_id),
+            message=str(data.get("orderStatusTitle") or status),
+            raw_data=data,
+        )
 
     async def find_recent_order(self, task: MonitorTask) -> OrderResult | None:
-        raise PlatformCapabilityUnavailable("摩天轮订单列表 API 尚未完成登录后验证")
+        common = _common_params()
+        payload = await self._request_json(
+            "POST",
+            f"{BASE_URL}/orderapi/buyer/order_base/v2/order_list",
+            action="find_recent_order",
+            params=common,
+            json_body={
+                **common,
+                "listType": "ONGOING",
+                "offset": 0,
+                "length": 10,
+            },
+            requires_auth=True,
+        )
+        data = _business_data(payload, "查询近期订单")
+        if isinstance(data, dict):
+            candidates = data.get("list") or data.get("orderList") or []
+        else:
+            candidates = data or []
+        required_values = {
+            task.ticket.event_id,
+            task.ticket.session_id,
+            task.ticket.listing_id,
+        }
+        for candidate in candidates:
+            order_id = str(
+                candidate.get("orderId") or candidate.get("orderOID") or ""
+            )
+            if not order_id:
+                continue
+            detail = await self.get_order_detail(order_id)
+            if required_values.issubset(_all_scalar_values(detail.raw_data)):
+                return detail
+        return None
