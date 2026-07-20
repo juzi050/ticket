@@ -46,8 +46,11 @@ async def test_real_motianlun_event(tmp_path) -> None:
     api = MotianlunApi(client, AuditRepository(database))
     try:
         event = await api.get_event(MOTIANLUN_EVENT_URL)
+        sessions = await api.list_sessions(event.event_id)
     finally:
         await api.close()
 
     assert event.event_id == "6a2fe62c2608110001207f4d"
     assert "洛天依" in event.event_name
+    assert sessions
+    assert all(session.event_id == event.event_id for session in sessions)

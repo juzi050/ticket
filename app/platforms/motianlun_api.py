@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -19,6 +20,7 @@ from app.platforms.http_api import PlatformCapabilityUnavailable, TicketPlatform
 
 BASE_URL = "https://m.motianlun.cn"
 WEB_VERSION = "6.76.1"
+CHINA_TIMEZONE = timezone(timedelta(hours=8))
 
 
 def _show_id(event_url: str) -> str:
@@ -49,12 +51,34 @@ def parse_event(event_url: str, payload: dict[str, Any]) -> EventInfo:
     )
 
 
+def _parse_start_time(value: Any) -> datetime | None:
+    if not value:
+        return None
+    parsed = datetime.fromisoformat(str(value))
+    return parsed.replace(tzinfo=CHINA_TIMEZONE) if parsed.tzinfo is None else parsed
+
+
+def parse_sessions(event_id: str, payload: dict[str, Any]) -> list[SessionInfo]:
+    return [
+        SessionInfo(
+            platform="motianlun",
+            event_id=event_id,
+            session_id=str(item["sessionId"]),
+            session_name=str(item["sessionName"]),
+            start_time=_parse_start_time(item.get("sessionShowTime")),
+            raw_data=item,
+        )
+        for item in payload.get("data", [])
+    ]
+
+
 class MotianlunApi(TicketPlatformApi):
     platform = "motianlun"
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._event_cache: dict[str, EventInfo] = {}
+        self._session_cache: dict[tuple[str, str], SessionInfo] = {}
 
     async def check_auth(self) -> bool:
         return False
@@ -72,7 +96,22 @@ class MotianlunApi(TicketPlatformApi):
         return event
 
     async def list_sessions(self, event_id: str) -> list[SessionInfo]:
-        raise PlatformCapabilityUnavailable("摩天轮场次 API 尚未实现")
+        event = self._event_cache.get(event_id)
+        city_id = str(event.raw_data.get("cityOID") if event else "3301")
+        payload = await self._request_json(
+            "GET",
+            f"{BASE_URL}/showapi/pub/v3/show/{event_id}/sessionone",
+            action="list_sessions",
+            params={
+                **_common_params(),
+                "locationCityOID": city_id,
+                "orderDecision": "RANDOM",
+            },
+        )
+        sessions = parse_sessions(event_id, payload)
+        for session in sessions:
+            self._session_cache[(event_id, session.session_id)] = session
+        return sessions
 
     async def list_tickets(
         self, event_id: str, session_id: str, quantity: int
