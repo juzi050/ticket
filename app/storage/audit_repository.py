@@ -216,6 +216,12 @@ class AuditRepository:
                 )
         return destination
 
+    async def clear(self) -> int:
+        async with self.database.connect() as connection:
+            cursor = await connection.execute("DELETE FROM audit_logs")
+            await connection.commit()
+            return max(cursor.rowcount, 0)
+
     @staticmethod
     def _json(value: Any) -> str | None:
         if value is None:

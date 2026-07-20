@@ -91,3 +91,6 @@ async def test_export_audit_logs_as_json_and_csv(tmp_path) -> None:
         rows = list(csv.DictReader(handle))
     assert len(rows) == 1
     assert rows[0]["message"] == "价格查询完成"
+
+    assert await repository.clear() == 1
+    assert await repository.query() == []
