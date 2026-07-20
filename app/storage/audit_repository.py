@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import csv
 import json
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from app.domain import PlatformName, utc_now
@@ -155,6 +157,38 @@ class AuditRepository:
             rows = await cursor.fetchall()
         return [self._from_row(row) for row in rows]
 
+    async def export_json(
+        self, path: str | Path, query: AuditQuery | None = None
+    ) -> Path:
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        rows = [self._serializable(row) for row in await self.query(query)]
+        destination.write_text(
+            json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return destination
+
+    async def export_csv(
+        self, path: str | Path, query: AuditQuery | None = None
+    ) -> Path:
+        destination = Path(path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        rows = [self._serializable(row) for row in await self.query(query)]
+        fieldnames = list(self._serializable(AuditEntry("", "", "", "")).keys())
+        with destination.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(
+                    {
+                        key: json.dumps(value, ensure_ascii=False)
+                        if isinstance(value, (dict, list))
+                        else value
+                        for key, value in row.items()
+                    }
+                )
+        return destination
+
     @staticmethod
     def _json(value: Any) -> str | None:
         if value is None:
@@ -191,3 +225,9 @@ class AuditRepository:
             exception_message=values["exception_message"],
             exception_stack=values["exception_stack"],
         )
+
+    @staticmethod
+    def _serializable(entry: AuditEntry) -> dict[str, Any]:
+        value = asdict(entry)
+        value["timestamp"] = entry.timestamp.isoformat()
+        return value

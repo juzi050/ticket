@@ -1,3 +1,6 @@
+import csv
+import json
+
 from app.storage.audit_repository import (
     REDACTED,
     AuditEntry,
@@ -54,3 +57,28 @@ async def test_append_and_query_audit_logs(tmp_path) -> None:
     assert len(rows) == 1
     assert rows[0].id == first_id
     assert rows[0].request_headers == {"Cookie": REDACTED, "Accept": "json"}
+
+
+async def test_export_audit_logs_as_json_and_csv(tmp_path) -> None:
+    database = MvpDatabase(tmp_path / "ticket.db")
+    await database.initialize()
+    repository = AuditRepository(database)
+    await repository.append(
+        AuditEntry(
+            level="INFO",
+            category="monitor",
+            action="check_price",
+            message="价格查询完成",
+            platform="motianlun",
+            request_headers={"Authorization": "secret"},
+        )
+    )
+
+    json_path = await repository.export_json(tmp_path / "export" / "audit.json")
+    csv_path = await repository.export_csv(tmp_path / "export" / "audit.csv")
+    exported = json.loads(json_path.read_text(encoding="utf-8"))
+    assert exported[0]["request_headers"]["Authorization"] == REDACTED
+    with csv_path.open(encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 1
+    assert rows[0]["message"] == "价格查询完成"
