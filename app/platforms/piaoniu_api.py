@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -62,6 +64,46 @@ def parse_sessions(event_id: str, payload: dict[str, Any]) -> list[SessionInfo]:
         for item in payload.get("events", [])
     ]
 
+
+def parse_ticket_groups(
+    *,
+    event_url: str,
+    event_id: str,
+    event_name: str,
+    session_id: str,
+    session_name: str,
+    quantity: int,
+    category: dict[str, Any],
+    payload: dict[str, Any],
+) -> list[TicketOption]:
+    quantity_group = payload.get("ticketGroups", {}).get(str(quantity), {})
+    groups = quantity_group.get("ticketGroups", [])
+    result: list[TicketOption] = []
+    for item in groups:
+        listing_id = str(item["id"])
+        addition = item.get("addition") or {}
+        seller_id = item.get("providerId") or item.get("shopId")
+        result.append(
+            TicketOption(
+                platform="piaoniu",
+                event_url=event_url,
+                event_id=event_id,
+                event_name=event_name,
+                session_id=session_id,
+                session_name=session_name,
+                listing_id=listing_id,
+                ticket_group_id=listing_id,
+                seller_id=str(seller_id) if seller_id else None,
+                ticket_name=str(category["specification"]),
+                area=str(item.get("areaName") or category["specification"]),
+                seat_description=str(item.get("areaName") or "") or None,
+                unit_price=Decimal(str(item["salePrice"])),
+                available_quantity=int(addition.get("numMax") or quantity),
+                raw_data={"category": category, "listing": item},
+            )
+        )
+    return result
+
 class PiaoniuApi(TicketPlatformApi):
     platform = "piaoniu"
 
@@ -102,12 +144,53 @@ class PiaoniuApi(TicketPlatformApi):
     async def list_tickets(
         self, event_id: str, session_id: str, quantity: int
     ) -> list[TicketOption]:
-        raise PlatformCapabilityUnavailable("票牛票品 API 尚未实现")
+        event = self._event_cache.get(event_id)
+        session = self._session_cache.get((event_id, session_id))
+        if event is None or session is None:
+            await self.list_sessions(event_id)
+            event = self._event_cache[event_id]
+            session = self._session_cache.get((event_id, session_id))
+        if session is None:
+            return []
+        categories = await self._request_json(
+            "GET",
+            f"{BASE_URL}/api/v1/ticketCategories.json",
+            action="list_ticket_categories",
+            params={"b2c": "true", "eventId": session_id},
+        )
+
+        async def fetch(category: dict[str, Any]) -> list[TicketOption]:
+            payload = await self._request_json(
+                "GET",
+                f"{BASE_URL}/api/v4/tickets.json",
+                action="list_tickets",
+                params={
+                    "b2c": "true",
+                    "eventId": session_id,
+                    "ticketCategoryId": category["id"],
+                },
+            )
+            return parse_ticket_groups(
+                event_url=event.event_url,
+                event_id=event_id,
+                event_name=event.event_name,
+                session_id=session_id,
+                session_name=session.session_name,
+                quantity=quantity,
+                category=category,
+                payload=payload,
+            )
+
+        nested = await asyncio.gather(*(fetch(category) for category in categories))
+        return [ticket for group in nested for ticket in group]
 
     async def get_exact_ticket(
         self, ticket: TicketOption, quantity: int
     ) -> TicketOption | None:
-        raise PlatformCapabilityUnavailable("票牛票品 API 尚未实现")
+        current = await self.list_tickets(ticket.event_id, ticket.session_id, quantity)
+        return next(
+            (item for item in current if item.listing_id == ticket.listing_id), None
+        )
 
     async def ensure_remote_buyers(self, buyers: list[BuyerProfile]) -> list[str]:
         raise PlatformCapabilityUnavailable("票牛购票人 API 尚未完成登录后验证")
