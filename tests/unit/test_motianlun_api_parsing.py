@@ -389,3 +389,6 @@ def test_maps_pending_status_and_countdown_deadline() -> None:
     deadline = _deadline_from_reserve_time(300)
     assert deadline is not None
     assert 295 <= (deadline - utc_now()).total_seconds() <= 300
+    millisecond_deadline = _deadline_from_reserve_time(300000)
+    assert millisecond_deadline is not None
+    assert 295 <= (millisecond_deadline - utc_now()).total_seconds() <= 300

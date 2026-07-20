@@ -326,7 +326,8 @@ def _deadline_from_reserve_time(value: Any) -> datetime | None:
         return datetime.fromtimestamp(number / 1000, tz=timezone.utc)
     if number > 1_000_000_000:
         return datetime.fromtimestamp(number, tz=timezone.utc)
-    return datetime.now(timezone.utc) + timedelta(seconds=number)
+    duration_seconds = number / 1000 if number > 86_400 else number
+    return datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)
 
 
 def _all_scalar_values(value: Any) -> set[str]:
