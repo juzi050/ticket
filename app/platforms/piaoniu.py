@@ -56,8 +56,8 @@ class PiaoniuPlatform(TicketPlatform):
         rules = automation or PlatformAutomationSettings(
             home_url="https://www.piaoniu.com/",
             login_trigger_text="登录",
-            authenticated_selectors=["text=退出登录", "text=我的订单"],
-            unauthenticated_selectors=["text=登录"],
+            authenticated_selectors=[".right-funcs .item-user:visible"],
+            unauthenticated_selectors=[".right-funcs .item-login:visible"],
         )
         self.session = BrowserSessionService(self.name, browser, rules)
         self.matcher = TicketMatcher()
@@ -67,10 +67,28 @@ class PiaoniuPlatform(TicketPlatform):
         await self.session.initialize()
 
     async def check_login_status(self) -> bool:
+        page = await self.session.page()
+        # 首页会通过 display 切换右上角的登录/用户入口。直接观察当前页，
+        # 避免等待短信或图形验证码时反复刷新并关闭登录弹窗。
+        if "piaoniu.com" in page.url:
+            user_entry = page.locator(".right-funcs .item-user:visible").first
+            if await user_entry.count() and await user_entry.is_visible():
+                await self.session.save_state()
+                return True
+            login_entry = page.locator(".right-funcs .item-login:visible").first
+            if await login_entry.count() and await login_entry.is_visible():
+                return False
         return await self.session.check_login_status()
 
     async def open_login_page(self) -> None:
-        await self.session.open_login_page()
+        page = await self.session.page()
+        await page.bring_to_front()
+        await page.goto(self.session.automation.home_url, wait_until="domcontentloaded")
+        trigger = page.locator(".right-funcs .item-login:visible").first
+        if not await trigger.count() or not await trigger.is_visible():
+            return
+        await trigger.click()
+        await page.locator(".light-login:visible").first.wait_for(state="visible")
 
     async def on_login_success(self) -> None:
         if self.session.settings.close_after_login:

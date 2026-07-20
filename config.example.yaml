@@ -36,9 +36,9 @@ platforms:
     home_url: https://www.piaoniu.com/
     login_trigger_text: 登录
     authenticated_selectors:
-      - "text=退出登录"
+      - ".right-funcs .item-user:visible"
     unauthenticated_selectors:
-      - "text=登录"
+      - ".right-funcs .item-login:visible"
   motianlun:
     home_url: https://m.motianlun.cn/
     login_url: https://m.motianlun.cn/package-functional-pages/account-login/account-login
