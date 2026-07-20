@@ -394,6 +394,10 @@ class MotianlunApi(TicketPlatformApi):
     async def get_exact_ticket(
         self, ticket: TicketOption, quantity: int
     ) -> TicketOption | None:
+        if ticket.event_id not in self._event_cache:
+            await self.get_event(ticket.event_url)
+        if (ticket.event_id, ticket.session_id) not in self._session_cache:
+            await self.list_sessions(ticket.event_id)
         current = await self.list_tickets(ticket.event_id, ticket.session_id, quantity)
         return next(
             (item for item in current if item.listing_id == ticket.listing_id), None
