@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,7 @@ class BrowserSessionService:
             self._context.set_default_timeout(self.settings.page_timeout_seconds * 1000)
             self._context.set_default_navigation_timeout(self.settings.page_timeout_seconds * 1000)
             self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
+            await self._restore_state()
         except Exception as exc:
             await self.close()
             raise PlatformError(f"{self.platform} 浏览器启动失败：{exc}") from exc
@@ -98,6 +100,29 @@ class BrowserSessionService:
     async def save_state(self) -> None:
         if self._context is not None:
             await self._context.storage_state(path=str(self.state_file.resolve()))
+
+    async def _restore_state(self) -> None:
+        """将 Storage State 恢复到持久化上下文，兼容仅靠资料目录无法恢复的站点。"""
+        if self._context is None or self._page is None or not self.state_file.exists():
+            return
+        try:
+            state = json.loads(self.state_file.read_text(encoding="utf-8"))
+            cookies = state.get("cookies", [])
+            if cookies:
+                await self._context.add_cookies(cookies)
+            for origin_state in state.get("origins", []):
+                origin = origin_state.get("origin")
+                entries = origin_state.get("localStorage", [])
+                if not origin or not entries:
+                    continue
+                await self._page.goto(origin, wait_until="domcontentloaded")
+                await self._page.evaluate(
+                    "entries => entries.forEach(item => localStorage.setItem(item.name, item.value))",
+                    entries,
+                )
+                await self._page.reload(wait_until="domcontentloaded")
+        except Exception as exc:
+            self.logger.warning("已保存的登录状态恢复失败，将使用浏览器资料目录继续：%s", exc)
 
     async def close(self) -> None:
         if self._context is not None:
