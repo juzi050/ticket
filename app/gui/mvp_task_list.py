@@ -38,6 +38,20 @@ def task_row(task: MonitorTask) -> tuple[str, ...]:
     )
 
 
+def sync_task_rows(tree: ttk.Treeview, tasks: list[MonitorTask]) -> None:
+    existing_ids = set(tree.get_children())
+    current_ids = {task.task_id for task in tasks}
+    for task in tasks:
+        values = task_row(task)
+        if task.task_id in existing_ids:
+            tree.item(task.task_id, values=values)
+        else:
+            tree.insert("", "end", iid=task.task_id, values=values)
+    stale_ids = existing_ids - current_ids
+    if stale_ids:
+        tree.delete(*stale_ids)
+
+
 class MvpTaskList(ttk.Frame):
     def __init__(
         self,
@@ -135,9 +149,7 @@ class MvpTaskList(ttk.Frame):
 
     def _render(self, tasks: list[MonitorTask]) -> None:
         self.tasks = {task.task_id: task for task in tasks}
-        self.tree.delete(*self.tree.get_children())
-        for task in tasks:
-            self.tree.insert("", "end", iid=task.task_id, values=task_row(task))
+        sync_task_rows(self.tree, tasks)
 
     def toggle(self) -> None:
         task = self.selected()
