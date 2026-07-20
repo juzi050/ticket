@@ -1,4 +1,4 @@
-from app.platforms.piaoniu_api import _activity_id, parse_event
+from app.platforms.piaoniu_api import _activity_id, parse_event, parse_sessions
 
 
 def test_parse_piaoniu_event() -> None:
@@ -13,3 +13,6 @@ def test_parse_piaoniu_event() -> None:
     assert _activity_id(url) == "779707"
     event = parse_event(url, payload)
     assert event.event_name == "测试演出"
+    sessions = parse_sessions(event.event_id, payload)
+    assert sessions[0].session_id == "14944160"
+    assert sessions[0].start_time is not None

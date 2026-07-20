@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -18,6 +19,7 @@ from app.platforms.http_api import PlatformCapabilityUnavailable, TicketPlatform
 
 
 BASE_URL = "https://www.piaoniu.com"
+CHINA_TIMEZONE = timezone(timedelta(hours=8))
 
 
 def _activity_id(event_url: str) -> str:
@@ -40,12 +42,33 @@ def parse_event(event_url: str, payload: dict[str, Any]) -> EventInfo:
         raw_data=payload,
     )
 
+
+def _parse_start_time(milliseconds: Any) -> datetime | None:
+    if milliseconds in (None, ""):
+        return None
+    return datetime.fromtimestamp(float(milliseconds) / 1000, tz=CHINA_TIMEZONE)
+
+
+def parse_sessions(event_id: str, payload: dict[str, Any]) -> list[SessionInfo]:
+    return [
+        SessionInfo(
+            platform="piaoniu",
+            event_id=event_id,
+            session_id=str(item["id"]),
+            session_name=str(item["specification"]),
+            start_time=_parse_start_time(item.get("start")),
+            raw_data=item,
+        )
+        for item in payload.get("events", [])
+    ]
+
 class PiaoniuApi(TicketPlatformApi):
     platform = "piaoniu"
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._event_cache: dict[str, EventInfo] = {}
+        self._session_cache: dict[tuple[str, str], SessionInfo] = {}
 
     async def check_auth(self) -> bool:
         return False
@@ -62,7 +85,19 @@ class PiaoniuApi(TicketPlatformApi):
         return event
 
     async def list_sessions(self, event_id: str) -> list[SessionInfo]:
-        raise PlatformCapabilityUnavailable("票牛场次 API 尚未实现")
+        payload = await self._request_json(
+            "GET",
+            f"{BASE_URL}/api/v1/activities/{event_id}.json",
+            action="list_sessions",
+        )
+        sessions = parse_sessions(event_id, payload)
+        for session in sessions:
+            self._session_cache[(event_id, session.session_id)] = session
+        if event_id not in self._event_cache:
+            self._event_cache[event_id] = parse_event(
+                f"{BASE_URL}/activity/{event_id}", payload
+            )
+        return sessions
 
     async def list_tickets(
         self, event_id: str, session_id: str, quantity: int
