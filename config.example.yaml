@@ -41,8 +41,12 @@ platforms:
       - "text=登录"
   motianlun:
     home_url: https://m.motianlun.cn/
-    authenticated_selectors: []
-    unauthenticated_selectors: []
+    login_url: https://m.motianlun.cn/package-functional-pages/account-login/account-login
+    auth_check_url: https://m.motianlun.cn/pages/mine/mine
+    authenticated_selectors:
+      - "text=我的订单"
+    unauthenticated_selectors:
+      - "text=点击登录"
 
 tasks:
   - task_id: piaoniu_001

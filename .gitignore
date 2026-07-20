@@ -11,5 +11,6 @@ data/browser_states/*
 data/browser_profiles/*
 logs/*.log*
 output/playwright/
+.playwright-cli/
 !data/browser_states/.gitkeep
 !data/browser_profiles/.gitkeep
