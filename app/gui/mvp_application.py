@@ -72,8 +72,10 @@ class MvpApplication:
         self.scheduler = MonitorScheduler(
             self.tasks, self.audit, self.monitor.check_once
         )
+        self._task_refresh_job: str | None = None
         self._configure_root()
         self._build()
+        self._schedule_task_refresh()
         self.runner.submit(self._startup())
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -170,6 +172,13 @@ class MvpApplication:
         self.task_panel.refresh()
         self.runner.submit(self.scheduler.start())
 
+    def _schedule_task_refresh(self) -> None:
+        self._task_refresh_job = self.root.after(1000, self._refresh_task_panel)
+
+    def _refresh_task_panel(self) -> None:
+        self.task_panel.refresh()
+        self._schedule_task_refresh()
+
     def schedule_task(self, task_id: str, enabled: bool) -> None:
         operation = (
             self.scheduler.resume(task_id) if enabled else self.scheduler.pause(task_id)
@@ -228,6 +237,10 @@ class MvpApplication:
         )
 
     def close(self) -> None:
+        if self._task_refresh_job is not None:
+            self.root.after_cancel(self._task_refresh_job)
+            self._task_refresh_job = None
+
         async def shutdown() -> None:
             await self.scheduler.stop()
             await self.audit.append(
