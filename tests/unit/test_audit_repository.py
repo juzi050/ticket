@@ -7,6 +7,7 @@ from app.storage.audit_repository import (
     AuditQuery,
     AuditRepository,
     scrub_secrets,
+    scrub_url,
 )
 from app.storage.database import MvpDatabase
 
@@ -21,6 +22,14 @@ def test_scrub_secrets_recursively() -> None:
     assert scrubbed["Authorization"] == REDACTED
     assert scrubbed["nested"] == {"csrf_token": REDACTED, "visible": "ok"}
     assert scrubbed["items"] == [{"send-key": REDACTED}]
+
+
+def test_scrub_url_redacts_auth_query_values() -> None:
+    url = "https://example.com/api?accessToken=secret&id=event-1&refresh_token=hidden"
+    scrubbed = scrub_url(url)
+    assert "secret" not in scrubbed
+    assert "hidden" not in scrubbed
+    assert "id=event-1" in scrubbed
 
 
 async def test_append_and_query_audit_logs(tmp_path) -> None:

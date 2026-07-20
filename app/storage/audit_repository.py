@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from app.domain import PlatformName, utc_now
 from app.storage.database import MvpDatabase
@@ -14,12 +15,15 @@ from app.storage.database import MvpDatabase
 REDACTED = "[REDACTED]"
 SECRET_KEYS = {
     "authorization",
+    "accesstoken",
     "cookie",
     "csrf",
     "csrftoken",
     "sendkey",
     "setcookie",
     "token",
+    "refreshtoken",
+    "sessiontoken",
     "xcsrftoken",
     "xxsrftoken",
 }
@@ -29,11 +33,34 @@ def _normalized_key(value: str) -> str:
     return "".join(character for character in value.lower() if character.isalnum())
 
 
+def _is_secret_key(value: str) -> bool:
+    normalized = _normalized_key(value)
+    return (
+        normalized in SECRET_KEYS
+        or normalized.endswith("token")
+        or "password" in normalized
+        or normalized in {"otp", "smscode", "verificationcode"}
+    )
+
+
+def scrub_url(url: str | None) -> str | None:
+    if not url:
+        return url
+    parsed = urlsplit(url)
+    query = urlencode(
+        [
+            (key, REDACTED if _is_secret_key(key) else value)
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+        ]
+    )
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, parsed.fragment))
+
+
 def scrub_secrets(value: Any) -> Any:
     if isinstance(value, dict):
         return {
             key: REDACTED
-            if _normalized_key(str(key)) in SECRET_KEYS
+            if _is_secret_key(str(key))
             else scrub_secrets(item)
             for key, item in value.items()
         }
@@ -106,7 +133,7 @@ class AuditRepository:
                     entry.buyer_id,
                     entry.order_id,
                     entry.message,
-                    entry.request_url,
+                    scrub_url(entry.request_url),
                     entry.request_method,
                     self._json(entry.request_headers),
                     self._json(entry.request_body),
