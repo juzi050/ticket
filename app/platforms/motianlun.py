@@ -7,19 +7,38 @@ from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
 from app.config import BrowserSettings, MonitorTask, PlatformAutomationSettings
-from app.exceptions import PlatformError
-from app.models import LockOrderRequest, LockOrderResult, LockStatus, MatchResult, TicketInfo
+from app.exceptions import PlatformError, QuantityUnavailableError
+from app.models import (
+    FailureKind,
+    LockOrderRequest,
+    LockOrderResult,
+    LockStage,
+    LockStatus,
+    MatchResult,
+    TicketInfo,
+)
 from app.platforms.base import TicketPlatform
 from app.platforms.page_helpers import (
     compact_text,
     detect_interruption,
     event_id_from_url,
+    final_price_is_safe,
+    SAFE_ORDER_SUBMIT_PATTERN,
+    listing_fingerprint,
     matches_session,
     safe_page_url,
     visible_body_text,
 )
 from app.services.session_service import BrowserSessionService
 from app.services.ticket_matcher import TicketMatcher, parse_price
+
+
+def require_exact_quantity(values: list[int], requested: int) -> int:
+    if requested not in values:
+        raise QuantityUnavailableError(
+            f"当前场次没有精确的 {requested} 张选项，可选数量：{values or '无'}"
+        )
+    return requested
 
 
 class MotianlunPlatform(TicketPlatform):
@@ -55,7 +74,7 @@ class MotianlunPlatform(TicketPlatform):
 
     async def search_event(self, task: MonitorTask) -> Any:
         return {
-            "event_id": task.event_id or event_id_from_url(task.event_url, "showId"),
+            "event_id": event_id_from_url(task.event_url, "showId"),
             "url": task.event_url,
         }
 
@@ -66,9 +85,12 @@ class MotianlunPlatform(TicketPlatform):
             sessions = await self._session_choices(page, task)
             result: list[TicketInfo] = []
             for session_name in sessions:
-                actual_count = await self._open_ticket_list(
-                    page, task.event_url, session_name, task.quantity
-                )
+                try:
+                    actual_count = await self._open_ticket_list(
+                        page, task.event_url, session_name, task.quantity
+                    )
+                except QuantityUnavailableError:
+                    continue
                 result.extend(await self._read_ticket_list(page, task, session_name, actual_count))
             return result
 
@@ -79,17 +101,27 @@ class MotianlunPlatform(TicketPlatform):
         async with self._page_lock:
             page = await self._page()
             try:
+                await request.transition(LockStage.SELECTING_QUANTITY, "选择精确购票数量")
                 actual_count = await self._open_ticket_list(
                     page,
                     request.ticket.detail_url,
                     str(request.ticket.raw.get("session_name", request.ticket.session_name)),
                     request.quantity,
                 )
-                if actual_count < request.quantity:
-                    return LockOrderResult(LockStatus.QUANTITY_INSUFFICIENT, "当前场次可选人数不足")
+                if actual_count != request.quantity:
+                    return LockOrderResult(
+                        LockStatus.QUANTITY_INSUFFICIENT,
+                        "页面实际选择数量与任务配置不一致，已停止锁单",
+                        failure_kind=FailureKind.NON_RETRYABLE,
+                        stage=LockStage.SELECTING_QUANTITY,
+                    )
                 item = await self._find_listing(page, request.ticket)
                 if item is None:
-                    return LockOrderResult(LockStatus.OUT_OF_STOCK, "目标票品已不可购买")
+                    return LockOrderResult(
+                        LockStatus.OUT_OF_STOCK,
+                        "原目标票品已不可购买，未使用相似票品替代",
+                        failure_kind=FailureKind.RETRYABLE,
+                    )
                 current_price = parse_price(
                     await item.locator(".price-display").first.inner_text()
                 )
@@ -120,11 +152,34 @@ class MotianlunPlatform(TicketPlatform):
                     status, message = interruption
                     return LockOrderResult(status, message, requires_manual_action=True)
 
+                await request.transition(LockStage.SELECTING_AUDIENCE, "核对已保存观演人")
+                body = await visible_body_text(page)
+                if re.search(r"需填\d*位观演人|选择/新增|请选择.{0,6}观演人", body):
+                    return LockOrderResult(
+                        LockStatus.MANUAL_PROFILE_MISSING,
+                        "摩天轮观演人选择器尚未通过真实页面验证，请人工选择已保存观演人",
+                        order_url=safe_page_url(page.url),
+                        requires_manual_action=True,
+                        failure_kind=FailureKind.MANUAL_ACTION,
+                        stage=LockStage.SELECTING_AUDIENCE,
+                    )
+
+                await request.transition(LockStage.SELECTING_CONTACT, "核对已保存联系人和地址")
+                await request.transition(LockStage.VERIFYING_FINAL_PRICE, "读取订单最终应付金额")
                 total_locator = page.locator(".total .price-text").first
                 await total_locator.wait_for(state="visible")
-                final_total = parse_price(await total_locator.inner_text())
+                try:
+                    final_total = parse_price(await total_locator.inner_text())
+                except ValueError:
+                    return LockOrderResult(
+                        LockStatus.PRICE_CHANGED,
+                        "无法可靠读取最终应付金额，已停止提交",
+                        order_url=safe_page_url(page.url),
+                        failure_kind=FailureKind.RETRYABLE,
+                        stage=LockStage.VERIFYING_FINAL_PRICE,
+                    )
                 order_url = safe_page_url(page.url)
-                if final_total > request.max_total_price:
+                if not final_price_is_safe(final_total, request.max_total_price):
                     return LockOrderResult(
                         LockStatus.PRICE_CHANGED,
                         "订单确认页实际应付金额超过配置上限，已停止提交",
@@ -133,14 +188,6 @@ class MotianlunPlatform(TicketPlatform):
                     )
 
                 body = await visible_body_text(page)
-                if re.search(r"需填\d*位观演人|选择/新增|请选择.{0,6}观演人", body):
-                    return LockOrderResult(
-                        LockStatus.MANUAL_CONFIRMATION,
-                        "最终金额已核对，订单还需要人工选择实名观演人",
-                        final_total=final_total,
-                        order_url=order_url,
-                        requires_manual_action=True,
-                    )
                 if "立即支付" in body or "确认支付" in body:
                     return LockOrderResult(
                         LockStatus.MANUAL_CONFIRMATION,
@@ -148,10 +195,13 @@ class MotianlunPlatform(TicketPlatform):
                         final_total=final_total,
                         order_url=order_url,
                         requires_manual_action=True,
+                        failure_kind=FailureKind.MANUAL_ACTION,
+                        stage=LockStage.READY_TO_SUBMIT,
                     )
 
+                await request.transition(LockStage.READY_TO_SUBMIT, "资料与金额校验完成")
                 submit = page.locator("button, uni-button").filter(
-                    has_text=re.compile(r"^(提交订单|确认订单|确认下单)$")
+                    has_text=SAFE_ORDER_SUBMIT_PATTERN
                 ).first
                 if not await submit.count() or not await submit.is_visible():
                     return LockOrderResult(
@@ -160,7 +210,10 @@ class MotianlunPlatform(TicketPlatform):
                         final_total=final_total,
                         order_url=order_url,
                         requires_manual_action=True,
+                        failure_kind=FailureKind.MANUAL_ACTION,
+                        stage=LockStage.READY_TO_SUBMIT,
                     )
+                await request.transition(LockStage.SUBMITTING, "提交订单，不进入支付操作")
                 await submit.click()
                 await page.wait_for_timeout(1_500)
                 interruption = await detect_interruption(page)
@@ -176,13 +229,15 @@ class MotianlunPlatform(TicketPlatform):
                 result_text = await visible_body_text(page)
                 order_match = re.search(r"订单(?:号|编号)\s*[：:]?\s*([A-Za-z0-9-]+)", result_text)
                 if order_match or "待支付" in result_text or "/order-detail/" in page.url:
+                    await request.transition(LockStage.PAYMENT_PENDING, "订单已进入待支付")
                     return LockOrderResult(
-                        LockStatus.SUCCESS,
+                        LockStatus.PAYMENT_PENDING,
                         "摩天轮订单已提交并停留在待支付阶段，请手动付款",
                         order_id=order_match.group(1) if order_match else None,
                         final_total=final_total,
                         order_url=safe_page_url(page.url),
                         requires_manual_action=True,
+                        stage=LockStage.PAYMENT_PENDING,
                     )
                 return LockOrderResult(
                     LockStatus.MANUAL_CONFIRMATION,
@@ -190,9 +245,22 @@ class MotianlunPlatform(TicketPlatform):
                     final_total=final_total,
                     order_url=safe_page_url(page.url),
                     requires_manual_action=True,
+                    failure_kind=FailureKind.MANUAL_ACTION,
+                    stage=LockStage.SUBMITTING,
+                )
+            except QuantityUnavailableError as exc:
+                return LockOrderResult(
+                    LockStatus.QUANTITY_INSUFFICIENT,
+                    str(exc),
+                    failure_kind=FailureKind.RETRYABLE,
+                    stage=LockStage.SELECTING_QUANTITY,
                 )
             except Exception as exc:
-                return LockOrderResult(LockStatus.PAGE_CHANGED, f"摩天轮页面操作失败：{exc}")
+                return LockOrderResult(
+                    LockStatus.PAGE_CHANGED,
+                    f"摩天轮页面操作失败：{exc}",
+                    failure_kind=FailureKind.RETRYABLE,
+                )
 
     async def _page(self) -> Any:
         page = await self.session.page()
@@ -249,10 +317,8 @@ class MotianlunPlatform(TicketPlatform):
             match = re.fullmatch(r"count-(\d+)", value)
             if match:
                 values.append(int(match.group(1)))
-        actual_count = quantity if quantity in values else max(values, default=0)
-        if not actual_count:
-            raise PlatformError("当前场次没有可选购人数")
-        await page.locator(f"#count-{actual_count}").click()
+        actual_count = require_exact_quantity(values, quantity)
+        await page.locator(f"#count-{quantity}").click()
         await page.locator(".session-selecter .button-container .mtl-button").click()
         await page.wait_for_url(re.compile(r"seat-and-seatplan|account-login"))
         interruption = await detect_interruption(page)
@@ -274,7 +340,7 @@ class MotianlunPlatform(TicketPlatform):
     ) -> list[TicketInfo]:
         title = (await page.title()).split("|", 1)[-1].strip()
         query = dict(parse_qsl(urlsplit(page.url).query, keep_blank_values=True))
-        event_id = task.event_id or query.get("showId") or event_id_from_url(task.event_url, "showId")
+        event_id = query.get("showId") or event_id_from_url(task.event_url, "showId")
         session_id = query.get("sessionId") or session_name
         body = await visible_body_text(page)
         adjacent = True if actual_count == 1 or "保证连座票品" in body else None
@@ -289,6 +355,9 @@ class MotianlunPlatform(TicketPlatform):
             if await tag_locator.count():
                 tags = (await tag_locator.inner_text()).strip()
             unit_price = parse_price(await item.locator(".price-display").inner_text())
+            listing_id = listing_fingerprint(
+                str(session_id), level, unit_price, seat_description, tags
+            )
             result.append(
                 TicketInfo(
                     platform=self.name,
@@ -301,6 +370,8 @@ class MotianlunPlatform(TicketPlatform):
                     total_price=unit_price * task.quantity,
                     available_quantity=actual_count,
                     detail_url=task.event_url,
+                    listing_id=listing_id,
+                    seller_id=tags,
                     area=level,
                     stand="看台" if "看台" in level else None,
                     seat=seat_description or None,
@@ -314,6 +385,7 @@ class MotianlunPlatform(TicketPlatform):
                         "listing_index": index,
                         "unit_price": str(unit_price),
                         "ticket_count": actual_count,
+                        "listing_id": listing_id,
                         "idempotency_scope": "motianlun-default-profile",
                     },
                 )
@@ -323,18 +395,17 @@ class MotianlunPlatform(TicketPlatform):
     async def _find_listing(self, page: Any, ticket: TicketInfo) -> Any | None:
         items = page.locator(".ticket-container .ticket-item")
         expected_name = str(ticket.raw.get("ticket_name", ticket.ticket_level))
-        expected_price = ticket.unit_price
-        expected_seat = str(ticket.raw.get("seat_description", ""))
         for index in range(await items.count()):
             item = items.nth(index)
             name = await item.locator(".ticket-display-name").inner_text()
             seat = await item.locator(".ticket-seat-desc").inner_text()
             price = parse_price(await item.locator(".price-display").inner_text())
-            if (
-                compact_text(name) == compact_text(expected_name)
-                and price == expected_price
-                and (not expected_seat or compact_text(seat) == compact_text(expected_seat))
-            ):
+            tag_locator = item.locator(".ticket-tag-container")
+            tags = (await tag_locator.inner_text()).strip() if await tag_locator.count() else ""
+            current_id = listing_fingerprint(
+                ticket.session_id, name, price, seat, tags
+            )
+            if current_id == ticket.listing_id and compact_text(name) == compact_text(expected_name):
                 return item
         return None
 

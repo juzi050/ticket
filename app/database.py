@@ -10,7 +10,10 @@ from typing import Any
 import aiosqlite
 
 from app.config import MonitorTask
-from app.models import LockOrderRequest, LockOrderResult, MatchResult, TicketInfo
+from app.models import LockOrderRequest, LockOrderResult, LockStage, MatchResult, TicketInfo
+
+
+_PERMANENT_LOCK_STATUSES = {"success", "payment_pending", "order_exists"}
 
 
 def utc_now() -> datetime:
@@ -97,9 +100,38 @@ class Database:
                     sent_at TEXT NOT NULL,
                     error_reason TEXT
                 );
+                CREATE TABLE IF NOT EXISTS lock_stage_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    idempotency_key TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    message TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_lock_stage_key
+                    ON lock_stage_records(idempotency_key, created_at);
                 """
             )
+            await self._ensure_columns(
+                db,
+                "lock_records",
+                {
+                    "account_alias": "TEXT NOT NULL DEFAULT ''",
+                    "listing_id": "TEXT NOT NULL DEFAULT ''",
+                    "failure_kind": "TEXT",
+                },
+            )
             await db.commit()
+
+    @staticmethod
+    async def _ensure_columns(
+        db: aiosqlite.Connection, table: str, columns: dict[str, str]
+    ) -> None:
+        cursor = await db.execute(f"PRAGMA table_info({table})")
+        existing = {str(row[1]) for row in await cursor.fetchall()}
+        for name, definition in columns.items():
+            if name not in existing:
+                await db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
     async def upsert_task(self, task: MonitorTask, status: str = "pending") -> None:
         now = utc_now().isoformat()
@@ -204,6 +236,8 @@ class Database:
     async def claim_lock(
         self, request: LockOrderRequest, max_attempts: int, cooldown_seconds: int = 0
     ) -> bool:
+        # 保留参数以兼容现有调用；attempt_count 只用于审计，不再永久封禁临时失败。
+        _ = max_attempts
         current_time = utc_now()
         now = current_time.isoformat()
         async with aiosqlite.connect(self.path) as db:
@@ -214,8 +248,8 @@ class Database:
             )
             existing = await cursor.fetchone()
             if existing:
-                status, attempts, updated_at = existing
-                if status in {"success", "in_progress"} or attempts >= max_attempts:
+                status, _attempts, updated_at = existing
+                if status in _PERMANENT_LOCK_STATUSES:
                     await db.rollback()
                     return False
                 last_update = datetime.fromisoformat(updated_at)
@@ -235,12 +269,13 @@ class Database:
                     """
                     INSERT INTO lock_records(
                         idempotency_key, task_id, platform, event_id, session_id, area, price,
-                        quantity, status, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?)
+                        quantity, status, account_alias, listing_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', ?, ?, ?, ?)
                     """,
                     (
                         request.idempotency_key, request.task_id, ticket.platform, ticket.event_id,
-                        ticket.session_id, ticket.area, str(ticket.payable_total), request.quantity, now, now,
+                        ticket.session_id, ticket.area, str(ticket.payable_total), request.quantity,
+                        request.account_alias, ticket.listing_id, now, now,
                     ),
                 )
             await db.commit()
@@ -251,13 +286,60 @@ class Database:
             await db.execute(
                 """
                 UPDATE lock_records SET status=?, order_id=?, price=COALESCE(?, price),
-                    error_reason=?, updated_at=? WHERE idempotency_key=?
+                    error_reason=?, failure_kind=?, updated_at=? WHERE idempotency_key=?
                 """,
                 (
                     result.status.value, result.order_id,
                     str(result.final_total) if result.final_total is not None else None,
-                    None if result.success else result.message, utc_now().isoformat(), key,
+                    None if result.success else result.message,
+                    result.failure_kind.value if result.failure_kind else None,
+                    utc_now().isoformat(), key,
                 ),
+            )
+            await db.commit()
+
+    async def get_lock_record(self, key: str) -> dict[str, Any] | None:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM lock_records WHERE idempotency_key=?", (key,)
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def has_pending_order(
+        self,
+        *,
+        account_alias: str,
+        platform: str,
+        event_id: str,
+        session_id: str,
+        listing_id: str,
+        quantity: int,
+    ) -> bool:
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                """
+                SELECT 1 FROM lock_records
+                WHERE account_alias=? AND platform=? AND event_id=? AND session_id=?
+                    AND listing_id=? AND quantity=?
+                    AND status IN ('success', 'payment_pending', 'order_exists')
+                LIMIT 1
+                """,
+                (account_alias, platform, event_id, session_id, listing_id, quantity),
+            )
+            return await cursor.fetchone() is not None
+
+    async def record_lock_stage(
+        self, key: str, task_id: str, stage: LockStage, message: str = ""
+    ) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """
+                INSERT INTO lock_stage_records(idempotency_key, task_id, stage, message, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (key, task_id, stage.value, message, utc_now().isoformat()),
             )
             await db.commit()
 
@@ -294,8 +376,13 @@ class Database:
                 "SELECT * FROM lock_records WHERE task_id=? ORDER BY updated_at DESC LIMIT ?",
                 (task_id, limit),
             )
+            stages_cursor = await db.execute(
+                "SELECT * FROM lock_stage_records WHERE task_id=? ORDER BY created_at DESC LIMIT ?",
+                (task_id, limit),
+            )
             return {
                 "prices": [dict(row) for row in await prices_cursor.fetchall()],
                 "matches": [dict(row) for row in await matches_cursor.fetchall()],
                 "locks": [dict(row) for row in await locks_cursor.fetchall()],
+                "stages": [dict(row) for row in await stages_cursor.fetchall()],
             }

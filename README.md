@@ -1,6 +1,6 @@
 # Python 票务价格监控与锁单辅助系统
 
-这是一个面向 Python 3.11+、Windows 10/11 的异步票务监控项目。它提供多任务调度、价格和座位条件匹配、独立登录会话、锁单幂等控制、微信通知、SQLite 历史记录以及完整 Mock 演示。
+这是一个面向 Python 3.11+、Windows 10/11 的异步票务监控与严格锁单项目。它会提前完成确定性配置和预检，发现完全一致的票品后进入官方订单流程，并且最多停在待支付状态。
 
 > 重要：程序只辅助进入正常订单确认/锁库存流程，永远不会自动付款。验证码、短信、扫码、实名确认、风控和支付必须由用户人工完成。
 
@@ -12,7 +12,8 @@
 - `asyncio` 多任务调度、任务异常隔离、动态启停、随机抖动和降频；
 - 每个平台独立的持久化浏览器目录、Storage State 和异步登录锁；
 - SQLite 任务、价格、匹配、锁单、通知记录；
-- 锁单前重新查询、价格复核、SQLite 幂等占位和重试上限；
+- 锁单前按场次 ID、稳定票品 ID 和精确数量重新查询，原票品消失时禁止相似替换；
+- 本地私有购票档案、14 项启动前预检、阶段状态记录和按失败类型冷却重试；
 - 企业微信机器人、Server酱、PushPlus 和控制台通知；
 - 通知指数退避、后台发送、日志按天轮转和敏感字段脱敏；
 - 不依赖真实网站的 Mock 登录、监控、匹配、锁单、通知完整流程；
@@ -21,7 +22,8 @@
 真实平台现状：
 
 - 票牛已使用真实公开页面完成右上角登录弹窗、登录态检测，以及场次、票档、数量、售价、区域、连座和拆单费解析；支持普通场次列表与日历场次；等待验证码时不会刷新关闭登录弹窗；
-- 摩天轮已完成“我的”登录态验证，以及详情页场次/人数选择、票品单价/区域/随机座位/保证连座解析；
+- 摩天轮已完成“我的”登录态验证，以及详情页场次/精确人数选择、票品单价/区域/随机座位/保证连座解析；页面没有目标数量时不会改选最大数量；
+- 票牛锁单以 `ticket_group_id` 为准；摩天轮页面未提供真实票品 ID 时，使用“场次 ID + 票档 + 价格 + 座位描述 + 卖家标签”的指纹；
 - 两个平台锁单前都会重新打开页面复核票品和价格，再进入官方订单流程读取最终应付金额；金额超限立即停止；
 - 摩天轮当前订单页要求实名观演人且下一步按钮为“立即支付”，程序会在此暂停等待人工处理，不会点击支付；
 - 仅当页面明确显示独立的“提交订单/确认订单/确认下单”按钮时，程序才允许提交并停在待支付阶段；验证码、短信、实名补充、人工确认和付款始终暂停；
@@ -77,9 +79,36 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 
 ## 配置
 
-业务任务放在 `config.yaml`，敏感 Token/Webhook 放在 `.env`。这两个实际文件都已被 `.gitignore` 排除。
+业务任务放在 `config.yaml`，敏感 Token/Webhook 放在 `.env`，购票档案放在 `purchase_profiles.yaml`。这三个实际文件都已被 `.gitignore` 排除。
 
-每个任务支持：平台、演出名称和 ID、场次、日期时间、多票档、多区域、多看台、位置候选、排除词、区域正则、排号/座位号范围、区域优先级、数量、连座、单价/总价上限、独立查询间隔、随机抖动、自动锁单、通知、成功后停止、最大锁单次数和异常阈值。
+购票档案只保存平台账号中已有选项的引用，例如观演人名称或平台选项 ID、手机号后四位、联系人/地址标识和配送方式。不要填写完整身份证号、密码、Cookie 或支付信息。先在平台账号里保存观演人、联系人和地址，再复制示例：
+
+```powershell
+Copy-Item purchase_profiles.example.yaml purchase_profiles.yaml
+```
+
+正式配置应指向私有文件：
+
+```yaml
+purchase_profiles_file: purchase_profiles.yaml
+```
+
+每个任务支持：平台、演出名称和 ID、场次、日期时间、多票档、多区域、多看台、位置候选、排除词、区域正则、排号/座位号范围、区域优先级、数量、连座、单价/总价上限、独立查询间隔、随机抖动、自动锁单、通知、成功后停止和异常阈值。`attempt_count` 仅用于审计，不再因为达到次数上限永久封禁临时错误。
+
+严格自动锁单任务还应由 `discover`/`create-task` 写入 `target_session_id`、`target_listing_id`、票牛的 `target_ticket_group_id` 和 `purchase_profile_id`，不要手工猜 ID。
+
+```yaml
+strict_lock:
+  strict_quantity: true
+  strict_session_id: true
+  strict_listing_id: true
+  strict_audience_count: true
+  reject_unknown_final_price: true
+  reject_listing_replacement: true
+  max_price_slippage: 0
+  stop_before_payment: true
+  stage_timeout_seconds: 30
+```
 
 匹配规则：
 
@@ -134,6 +163,12 @@ PUSHPLUS_TOKEN=
 # 校验配置
 python main.py validate-config
 
+# 只读发现真实 ID、交互创建任务、执行启动前预检
+python main.py discover --platform piaoniu --url <event_url> --quantity 2
+python main.py discover --platform motianlun --url <event_url> --quantity 2
+python main.py create-task
+python main.py preflight --task-id piaoniu_001
+
 # 查看任务
 python main.py list
 
@@ -166,10 +201,10 @@ python main.py mock
 
 `python main.py mock` 在没有 `config.yaml` 时自动读取 `config.example.yaml`，并执行四轮快速演示：
 
-1. 首次检查模拟未登录，然后模拟人工登录成功；
+1. 使用示例私有档案完成登录、通知、场次 ID、票品 ID、精确数量和重复订单预检；
 2. 前两轮返回价格或数量不符合要求的票；
 3. 第三轮出现目标票并写入匹配记录；
-4. 自动锁单任务会再次查询复核，模拟锁库存成功并停在“待人工支付”状态；
+4. 自动锁单任务会再次按稳定 ID 查询复核，依次记录资料选择、金额确认和提交阶段，最终停在 `payment_pending`；
 5. 非自动锁单任务在第四轮结束；
 6. 所有价格、匹配、通知和锁单结果写入 SQLite。
 
@@ -183,7 +218,7 @@ Mock 会使用控制台通知，不发送真实微信消息，也不打开浏览
 python -m pytest -q
 ```
 
-覆盖配置解析和字段校验、价格解析、单价/总价、区域/排数/排除词/票档、重试、通知重试、登录并发锁、SQLite、锁单幂等和 Mock 端到端流程。
+覆盖配置与私有档案、摩天轮严格数量、精确票品 ID、同名同价隔离、预检、最终金额保护、冷却重试、待支付幂等、支付按钮隔离和 Mock 端到端流程。
 
 ## 数据、日志与恢复
 
@@ -192,7 +227,9 @@ python -m pytest -q
 - 持久化浏览器资料：`data/browser_profiles/<platform>/`；
 - 轮转日志：`logs/ticket_monitor.log`。
 
-任务运行状态、连续异常和历史会写入数据库。正常重启会重新加载配置及数据库状态；已经完成的锁单任务不会在同一数据库中重复提交，手动执行 `enable` 可将它恢复为待运行状态。
+任务运行状态、连续异常、锁单阶段和历史会写入数据库。状态机为：`PREFLIGHT → WATCHING → MATCHED → REVALIDATING → SELECTING_QUANTITY → SELECTING_AUDIENCE → SELECTING_CONTACT → VERIFYING_FINAL_PRICE → READY_TO_SUBMIT → SUBMITTING → PAYMENT_PENDING`。
+
+`success`、`payment_pending`、`order_exists` 永久阻止相同幂等键再次提交；`timeout`、`not_logged_in`、`out_of_stock`、`price_changed`、`page_changed`、`captcha_required`、`manual_profile_missing` 在冷却后允许重试。幂等键包含账号别名、平台、演出 ID、场次 ID、票品 ID 和数量。
 
 不要分享 `data/browser_states`、`data/browser_profiles`、`.env`、数据库或日志。它们可能包含账号会话或业务信息。
 
@@ -210,6 +247,16 @@ python -m pytest -q
 真实适配器只操作官方网页 DOM，不调用猜测的内部接口。票牛适配器位于 `app/platforms/piaoniu.py`，摩天轮适配器位于 `app/platforms/motianlun.py`；公共的场次文本、订单金额、验证中断和敏感 URL 清理逻辑位于 `app/platforms/page_helpers.py`。
 
 如果网站改版，请用 Playwright 重新核验未登录、已登录、详情页、场次、人数、票档、订单确认页和验证提示，再更新对应选择器。`lock_order` 必须先读取订单确认页最终金额；遇到验证码、短信、实名资料缺失、支付按钮或不确定页面状态时返回人工处理并停留在当前页面。
+
+### 仍需真实订单页人工验证的选择器
+
+以下 DOM 尚未在当前真实页面条件下得到稳定确认，代码不会虚构或启用它们：
+
+- 票牛订单确认页：实名观演人选项 ID/选中态、联系人选项、收货地址选项、购票须知复选框、独立“提交订单”按钮及待支付成功标记；
+- 摩天轮订单确认页：观演人选项 ID/选中态、联系人是否为独立字段、地址/配送选项、购票须知复选框，以及是否存在区别于“立即支付”的独立提交订单按钮；
+- 两个平台订单列表：用于跨数据库确认“相同待支付订单”的稳定演出、场次、票品和数量字段。
+
+在这些选择器完成真实验证前，相关流程会返回 `manual_profile_missing` 或人工处理状态，不会绕过验证，也不会点击“立即支付”“确认支付”“去支付”或“付款”。本地购票档案和 SQLite 幂等仍会提前阻止已知重复订单。
 
 ## 常见问题
 

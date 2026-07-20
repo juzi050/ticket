@@ -5,11 +5,13 @@ import logging
 
 from app.config import MonitorTask, Settings
 from app.database import Database
+from app.models import LockStage
 from app.platforms.base import TicketPlatform
 from app.platforms.mock import MockPlatform
 from app.platforms.motianlun import MotianlunPlatform
 from app.platforms.piaoniu import PiaoniuPlatform
 from app.services.monitor_service import MonitorService
+from app.services.preflight_service import PreflightService
 
 
 class PlatformRegistry:
@@ -38,12 +40,13 @@ class PlatformRegistry:
 class Scheduler:
     def __init__(
         self, settings: Settings, database: Database, registry: PlatformRegistry,
-        monitor: MonitorService,
+        monitor: MonitorService, preflight: PreflightService | None = None,
     ) -> None:
         self.settings = settings
         self.database = database
         self.registry = registry
         self.monitor = monitor
+        self.preflight = preflight
         self.logger = logging.getLogger("app.scheduler")
 
     async def run(self, task_id: str | None = None, *, max_cycles: int | None = None) -> None:
@@ -67,13 +70,31 @@ class Scheduler:
 
         running: dict[str, asyncio.Task[None]] = {}
         finished: set[str] = set()
+        if self.preflight is not None:
+            for task in selected:
+                if not task.enabled or not task.auto_lock or not initialized.get(task.platform, False):
+                    continue
+                await self.database.update_task_state(task.task_id, "PREFLIGHT")
+                await self.database.record_lock_stage(
+                    f"task:{task.task_id}", task.task_id, LockStage.PREFLIGHT, "执行启动前预检"
+                )
+                result = await self.preflight.run(task, self.registry.get(task.platform))
+                if not result.passed:
+                    failed = "；".join(
+                        f"{check.name}: {check.message}" for check in result.checks if not check.passed
+                    )
+                    self.logger.error("任务 %s 预检失败：%s", task.task_id, failed)
+                    await self.database.update_task_state(task.task_id, "preflight_failed")
+                    finished.add(task.task_id)
+                else:
+                    await self.database.update_task_state(task.task_id, "pending")
         try:
             while True:
                 for task in selected:
                     if task.task_id in finished or not initialized.get(task.platform, False):
                         continue
                     control = await self.database.get_task_control(task.task_id)
-                    if control and control[1] in {"completed", "adapter_unavailable"}:
+                    if control and control[1] in {"completed", "adapter_unavailable", "preflight_failed"}:
                         finished.add(task.task_id)
                         continue
                     enabled = bool(control and control[0])
@@ -96,7 +117,7 @@ class Scheduler:
                     except Exception as exc:
                         self.logger.exception("任务 %s 意外退出：%s", current_id, exc)
                     control = await self.database.get_task_control(current_id)
-                    if control and control[1] in {"completed", "demo_finished", "adapter_unavailable"}:
+                    if control and control[1] in {"completed", "demo_finished", "adapter_unavailable", "preflight_failed"}:
                         finished.add(current_id)
                     running.pop(current_id, None)
 

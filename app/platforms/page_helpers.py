@@ -1,10 +1,35 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from decimal import Decimal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from app.models import LockStatus
+
+
+SAFE_ORDER_SUBMIT_PATTERN = re.compile(r"^(提交订单|确认订单|确认下单)$")
+PAYMENT_ACTION_PATTERN = re.compile(r"(立即支付|确认支付|去支付|付款)")
+
+
+def final_price_is_safe(final_total: object | None, max_total: object) -> bool:
+    return final_total is not None and final_total <= max_total
+
+
+def is_safe_order_submit_label(label: str) -> bool:
+    text = compact_text(label)
+    return bool(SAFE_ORDER_SUBMIT_PATTERN.fullmatch(text)) and not PAYMENT_ACTION_PATTERN.search(text)
+
+
+def listing_fingerprint(
+    session_id: str, ticket_level: str, price: object, seat_description: str, seller_label: str
+) -> str:
+    """页面无真实票品 ID 时，使用已验证可读字段生成稳定指纹。"""
+    raw = "|".join(
+        compact_text(str(value))
+        for value in (session_id, ticket_level, price, seat_description, seller_label)
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 from app.services.ticket_matcher import parse_price
 
 

@@ -30,6 +30,20 @@ monitor:
   max_consecutive_errors: 5
   lock_cooldown_seconds: 60
 
+strict_lock:
+  strict_quantity: true
+  strict_session_id: true
+  strict_listing_id: true
+  strict_audience_count: true
+  reject_unknown_final_price: true
+  reject_listing_replacement: true
+  max_price_slippage: 0
+  stop_before_payment: true
+  stage_timeout_seconds: 30
+
+# 正式使用时改为 purchase_profiles.yaml；该私有文件已加入 .gitignore。
+purchase_profiles_file: purchase_profiles.example.yaml
+
 # 只有确认了真实页面标记后才填写。选择器采用 Playwright locator 语法。
 platforms:
   piaoniu:
@@ -54,7 +68,10 @@ tasks:
     platform: piaoniu
     event_name: 示例演唱会
     event_url: https://www.piaoniu.com/example
-    event_id: ""
+    event_id: mock-piaoniu_001
+    target_session_id: mock-session-1
+    target_listing_id: mock-listing-piaoniu_001
+    target_ticket_group_id: mock-group-piaoniu_001
     target_sessions:
       - "2026-08-01 19:30"
     target_ticket_levels:
@@ -86,12 +103,17 @@ tasks:
     notify: true
     stop_after_lock_success: true
     max_lock_attempts: 1
+    purchase_profile_id: example_two_people
 
   - task_id: piaoniu_002
     enabled: true
     platform: piaoniu
     event_name: 示例演唱会第二场
     event_url: https://www.piaoniu.com/example2
+    event_id: mock-piaoniu_002
+    target_session_id: mock-session-1
+    target_listing_id: mock-listing-piaoniu_002
+    target_ticket_group_id: mock-group-piaoniu_002
     target_sessions:
       - "2026-08-02 19:30"
     target_ticket_levels:
@@ -105,13 +127,16 @@ tasks:
     interval_seconds: 15
     auto_lock: false
     notify: true
+    purchase_profile_id: example_one_person
 
   - task_id: motianlun_001
     enabled: true
     platform: motianlun
     event_name: 示例音乐节
     event_url: https://m.motianlun.cn/example
-    event_id: ""
+    event_id: mock-motianlun_001
+    target_session_id: mock-session-1
+    target_listing_id: mock-listing-motianlun_001
     target_sessions:
       - "2026-09-01"
     target_ticket_levels:
@@ -128,3 +153,4 @@ tasks:
     notify: true
     stop_after_lock_success: true
     max_lock_attempts: 1
+    purchase_profile_id: example_two_people

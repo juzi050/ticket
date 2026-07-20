@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import typer
+import yaml
 from rich.console import Console
 from rich.table import Table
 
-from app.config import ConfigurationError, Settings, load_settings
+from app.config import ConfigurationError, MonitorTask, Settings, load_settings
 from app.database import Database
 from app.logger import setup_logging
 from app.models import NotificationMessage
@@ -19,9 +22,30 @@ from app.services.login_service import LoginService
 from app.services.monitor_service import MonitorService
 from app.services.notification_service import NotificationService
 from app.services.order_service import OrderService
+from app.services.preflight_service import PreflightService
 
 app = typer.Typer(help="票务价格监控与锁单辅助系统", no_args_is_help=True, add_completion=False)
 console = Console()
+
+
+async def _discover_tickets(
+    runtime: "Runtime", platform_name: str, event_url: str, quantity: int = 1
+):
+    platform = runtime.registry.get(platform_name)
+    await platform.initialize()
+    task = MonitorTask(
+        task_id="discover",
+        enabled=False,
+        platform=platform_name,
+        event_name="待发现演出",
+        event_url=event_url,
+        target_sessions=[],
+        target_ticket_levels=[],
+        quantity=quantity,
+        max_unit_price=Decimal("99999999"),
+        max_total_price=Decimal("99999999"),
+    )
+    return list(await platform.preflight_tickets(task))
 
 
 @dataclass(slots=True)
@@ -32,14 +56,17 @@ class Runtime:
     login: LoginService
     registry: PlatformRegistry
     scheduler: Scheduler
+    preflight: PreflightService
 
     async def close(self) -> None:
         await self.registry.close()
         await self.notifications.close()
 
 
-async def _runtime(config: Path, *, mock_mode: bool = False) -> Runtime:
-    settings = load_settings(config, allow_example=mock_mode)
+async def _runtime(
+    config: Path, *, mock_mode: bool = False, allow_example: bool = False
+) -> Runtime:
+    settings = load_settings(config, allow_example=mock_mode or allow_example)
     if mock_mode:
         settings.application.mock_mode = True
         settings.notification.provider = "console"
@@ -48,6 +75,9 @@ async def _runtime(config: Path, *, mock_mode: bool = False) -> Runtime:
         settings.login.retry_interval_seconds = 1
         settings.monitor.random_delay_min_seconds = 0
         settings.monitor.random_delay_max_seconds = 0
+        run_alias = uuid4().hex[:8]
+        for profile in settings.purchase_profiles:
+            profile.account_alias = f"{profile.account_alias}-{run_alias}"
         for task in settings.tasks:
             task.enabled = True
             task.interval_seconds = 0.05
@@ -60,10 +90,17 @@ async def _runtime(config: Path, *, mock_mode: bool = False) -> Runtime:
     notifications = NotificationService(notifier, database, settings.notification)
     login = LoginService(settings.login, notifications)
     registry = PlatformRegistry(settings)
-    order = OrderService(database, settings.monitor.lock_cooldown_seconds)
+    order = OrderService(
+        database,
+        settings.monitor.lock_cooldown_seconds,
+        settings.purchase_profiles,
+        settings.strict_lock.stage_timeout_seconds,
+        settings.strict_lock.max_price_slippage,
+    )
     monitor = MonitorService(database, login, order, notifications, settings.monitor)
-    scheduler = Scheduler(settings, database, registry, monitor)
-    return Runtime(settings, database, notifications, login, registry, scheduler)
+    preflight = PreflightService(settings, database, notifications)
+    scheduler = Scheduler(settings, database, registry, monitor, preflight)
+    return Runtime(settings, database, notifications, login, registry, scheduler, preflight)
 
 
 def _load_or_exit(config: Path, *, allow_example: bool = False) -> Settings:
@@ -119,6 +156,177 @@ def validate_config(
     """校验配置文件。"""
     settings = _load_or_exit(config)
     console.print(f"[green]配置有效，共 {len(settings.tasks)} 个任务。[/green]")
+
+
+@app.command()
+def preflight(
+    task_id: str = typer.Option(..., "--task-id", help="要预检的任务编号"),
+    config: Path = typer.Option(Path("config.yaml"), "--config"),
+) -> None:
+    """执行自动锁单启动前的全部确定性校验。"""
+
+    async def execute() -> bool:
+        runtime = await _runtime(config)
+        try:
+            task = next((item for item in runtime.settings.tasks if item.task_id == task_id), None)
+            if task is None:
+                raise ValueError(f"任务不存在：{task_id}")
+            platform = runtime.registry.get(task.platform)
+            await platform.initialize()
+            result = await runtime.preflight.run(task, platform)
+            table = Table("结果", "检查项", "说明")
+            for check in result.checks:
+                table.add_row("通过" if check.passed else "失败", check.name, check.message)
+            console.print(table)
+            return result.passed
+        finally:
+            await runtime.close()
+
+    try:
+        passed = asyncio.run(execute())
+    except (ConfigurationError, ValueError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(2) from exc
+    if not passed:
+        console.print("[red]预检未通过，auto_lock 任务不会启动。[/red]")
+        raise typer.Exit(2)
+    console.print("[green]预检全部通过。[/green]")
+
+
+@app.command()
+def discover(
+    platform: str = typer.Option(..., "--platform", help="piaoniu 或 motianlun"),
+    url: str = typer.Option(..., "--url", help="官方演出详情页 URL"),
+    quantity: int = typer.Option(1, "--quantity", min=1, help="只展示可精确选择该数量的票品"),
+    config: Path = typer.Option(Path("config.yaml"), "--config"),
+) -> None:
+    """只读发现演出、场次、票档与当前稳定票品 ID。"""
+    if platform not in {"piaoniu", "motianlun", "mock"}:
+        raise typer.BadParameter("platform 必须是 piaoniu、motianlun 或 mock")
+
+    async def execute():
+        runtime = await _runtime(config, allow_example=True)
+        try:
+            return await _discover_tickets(runtime, platform, url, quantity)
+        finally:
+            await runtime.close()
+
+    try:
+        tickets = asyncio.run(execute())
+    except (ConfigurationError, ValueError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(2) from exc
+    table = Table(
+        "演出ID", "场次 / ID", "票档", "listing_id", "ticket_group_id",
+        "区域/座位", "seller_id", "单价",
+    )
+    for ticket in tickets:
+        table.add_row(
+            ticket.event_id,
+            f"{ticket.session_name}\n{ticket.session_id}",
+            ticket.ticket_level,
+            ticket.listing_id,
+            ticket.ticket_group_id or "-",
+            " / ".join(filter(None, [ticket.area, ticket.seat])) or "-",
+            ticket.seller_id or "-",
+            str(ticket.unit_price),
+        )
+    console.print(table)
+    if not tickets:
+        console.print("[yellow]没有发现可稳定定位的当前票品。[/yellow]")
+
+
+@app.command("create-task")
+def create_task(
+    config: Path = typer.Option(Path("config.yaml"), "--config"),
+) -> None:
+    """交互发现并选择真实 ID，向现有配置追加一个任务。"""
+    if not config.exists():
+        console.print("[red]配置文件不存在，请先复制 config.example.yaml 为 config.yaml。[/red]")
+        raise typer.Exit(2)
+    platform = typer.prompt("平台（piaoniu/motianlun）")
+    if platform not in {"piaoniu", "motianlun"}:
+        raise typer.BadParameter("平台必须是 piaoniu 或 motianlun")
+    event_url = typer.prompt("官方演出详情页 URL")
+    quantity = typer.prompt("购买数量", type=int)
+    if quantity < 1:
+        raise typer.BadParameter("购买数量必须大于 0")
+
+    async def execute():
+        runtime = await _runtime(config)
+        try:
+            return runtime.settings, await _discover_tickets(
+                runtime, platform, event_url, quantity
+            )
+        finally:
+            await runtime.close()
+
+    try:
+        settings, tickets = asyncio.run(execute())
+    except (ConfigurationError, ValueError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(2) from exc
+    if not tickets:
+        console.print("[red]没有发现可用票品，未修改配置。[/red]")
+        raise typer.Exit(2)
+
+    sessions: list[tuple[str, str]] = []
+    for ticket in tickets:
+        value = (ticket.session_name, ticket.session_id)
+        if value not in sessions:
+            sessions.append(value)
+    for index, value in enumerate(sessions, 1):
+        console.print(f"{index}. {value[0]} ({value[1]})")
+    session_index = typer.prompt("选择场次序号", type=int)
+    if session_index < 1 or session_index > len(sessions):
+        raise typer.BadParameter("场次序号无效")
+    chosen_session = sessions[session_index - 1]
+    listings = [ticket for ticket in tickets if ticket.session_id == chosen_session[1]]
+    for index, ticket in enumerate(listings, 1):
+        console.print(
+            f"{index}. {ticket.ticket_level} / {ticket.area or '-'} / {ticket.unit_price} / "
+            f"{ticket.ticket_group_id or ticket.listing_id}"
+        )
+    listing_index = typer.prompt("选择票品序号", type=int)
+    if listing_index < 1 or listing_index > len(listings):
+        raise typer.BadParameter("票品序号无效")
+    chosen = listings[listing_index - 1]
+    profile_ids = [profile.profile_id for profile in settings.purchase_profiles]
+    if not profile_ids:
+        console.print("[red]私有购票档案为空，未修改配置。[/red]")
+        raise typer.Exit(2)
+    for index, profile_id in enumerate(profile_ids, 1):
+        console.print(f"{index}. {profile_id}")
+    profile_index = typer.prompt("选择购票档案序号", type=int)
+    if profile_index < 1 or profile_index > len(profile_ids):
+        raise typer.BadParameter("购票档案序号无效")
+
+    raw = yaml.safe_load(config.read_text(encoding="utf-8")) or {}
+    tasks = raw.setdefault("tasks", [])
+    task_id = typer.prompt("任务编号")
+    tasks.append(
+        {
+            "task_id": task_id,
+            "enabled": True,
+            "platform": platform,
+            "event_name": chosen.event_name,
+            "event_url": event_url,
+            "event_id": chosen.event_id,
+            "target_session_id": chosen.session_id,
+            "target_listing_id": chosen.listing_id,
+            "target_ticket_group_id": chosen.ticket_group_id,
+            "target_sessions": [chosen.session_name],
+            "target_ticket_levels": [chosen.ticket_level],
+            "target_areas": [chosen.area] if chosen.area else [],
+            "quantity": quantity,
+            "max_unit_price": str(chosen.unit_price),
+            "max_total_price": str(chosen.unit_price * quantity),
+            "auto_lock": False,
+            "purchase_profile_id": profile_ids[profile_index - 1],
+        }
+    )
+    config.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    console.print(f"[green]已追加任务 {task_id}。请核对价格上限并通过 preflight 后再启用 auto_lock。[/green]")
 
 
 @app.command("test-notification")

@@ -8,7 +8,7 @@ from app.config import MonitorSettings, MonitorTask
 from app.database import Database
 from app.exceptions import AdapterNotImplementedError, LoginRequiredError, RateLimitError
 from app.logger import task_logger
-from app.models import MatchResult, NotificationMessage, TicketInfo
+from app.models import LockStage, MatchResult, NotificationMessage, TicketInfo
 from app.platforms.base import TicketPlatform
 from app.services.login_service import LoginService
 from app.services.notification_service import NotificationService
@@ -66,7 +66,10 @@ class MonitorService:
         if initial_max > 0:
             await asyncio.sleep(random.uniform(initial_min, initial_max))
         logger.info("监控任务启动")
-        await self.database.update_task_state(task.task_id, "running")
+        await self.database.update_task_state(task.task_id, "WATCHING")
+        await self.database.record_lock_stage(
+            f"task:{task.task_id}", task.task_id, LockStage.WATCHING, "监控任务启动"
+        )
         while True:
             control = await self.database.get_task_control(task.task_id)
             if control is not None and not control[0]:
@@ -92,9 +95,13 @@ class MonitorService:
                     await self.database.record_price(task.task_id, ticket)
                 result: MatchResult = await platform.match_ticket(task, tickets)
                 errors = 0
-                await self.database.update_task_state(task.task_id, "running", last_run=True)
+                await self.database.update_task_state(task.task_id, "WATCHING", last_run=True)
                 if result.matched and result.ticket is not None:
                     ticket = result.ticket
+                    await self.database.update_task_state(task.task_id, "MATCHED", last_run=True)
+                    await self.database.record_lock_stage(
+                        f"task:{task.task_id}", task.task_id, LockStage.MATCHED, "发现符合条件的票品"
+                    )
                     logger.info("发现符合条件的票：%s / %s", ticket.ticket_level, ticket.area)
                     await self.database.record_match(task, result, task.auto_lock)
                     if task.notify:

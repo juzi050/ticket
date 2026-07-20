@@ -9,15 +9,25 @@ from typing import Any
 
 from app.config import BrowserSettings, MonitorTask, PlatformAutomationSettings
 from app.exceptions import PlatformError
-from app.models import LockOrderRequest, LockOrderResult, LockStatus, MatchResult, TicketInfo
+from app.models import (
+    FailureKind,
+    LockOrderRequest,
+    LockOrderResult,
+    LockStage,
+    LockStatus,
+    MatchResult,
+    TicketInfo,
+)
 from app.platforms.base import TicketPlatform
 from app.platforms.page_helpers import (
     compact_text,
     detect_interruption,
     event_id_from_url,
+    final_price_is_safe,
     matches_session,
     parse_labelled_amount,
     safe_page_url,
+    SAFE_ORDER_SUBMIT_PATTERN,
     visible_body_text,
 )
 from app.services.session_service import BrowserSessionService
@@ -95,7 +105,7 @@ class PiaoniuPlatform(TicketPlatform):
             await self.session.close()
 
     async def search_event(self, task: MonitorTask) -> Any:
-        return {"event_id": task.event_id or event_id_from_url(task.event_url), "url": task.event_url}
+        return {"event_id": event_id_from_url(task.event_url), "url": task.event_url}
 
     async def query_tickets(self, task: MonitorTask) -> Sequence[TicketInfo]:
         async with self._page_lock:
@@ -122,12 +132,24 @@ class PiaoniuPlatform(TicketPlatform):
                     return LockOrderResult(LockStatus.OUT_OF_STOCK, "目标票档已不可购买")
                 await category.click()
                 await page.wait_for_timeout(200)
+                await request.transition(LockStage.SELECTING_QUANTITY, "选择精确购票数量")
                 quantity = page.locator(
                     f'.b2c-num-picker .items .item[data-num="{request.quantity}"]:not(.disabled)'
                 ).first
                 if not await quantity.count():
                     return LockOrderResult(LockStatus.QUANTITY_INSUFFICIENT, "当前可购数量不足")
                 await quantity.click()
+                await page.wait_for_timeout(100)
+                groups = await self._selected_ticket_groups(page)
+                active_group = self._active_group(groups, await self._visible_price(page))
+                expected_group_id = request.ticket.ticket_group_id
+                if not expected_group_id or str(active_group.get("id", "")) != expected_group_id:
+                    return LockOrderResult(
+                        LockStatus.OUT_OF_STOCK,
+                        "原 ticket_group_id 已不可稳定定位，未使用同名同价票品替代",
+                        failure_kind=FailureKind.RETRYABLE,
+                        stage=LockStage.SELECTING_QUANTITY,
+                    )
                 unit_price = await self._visible_price(page)
                 estimated_total = unit_price * request.quantity
                 if unit_price > request.max_unit_price or estimated_total > request.max_total_price:
@@ -151,29 +173,47 @@ class PiaoniuPlatform(TicketPlatform):
                 final_total = parse_labelled_amount(body)
                 if final_total is None:
                     return LockOrderResult(
-                        LockStatus.MANUAL_CONFIRMATION,
-                        "已进入票牛订单流程，但未能可靠读取最终应付金额，请人工确认",
+                        LockStatus.PRICE_CHANGED,
+                        "已进入票牛订单流程，但无法可靠读取最终应付金额，已停止提交",
                         order_url=safe_page_url(page.url),
-                        requires_manual_action=True,
+                        failure_kind=FailureKind.RETRYABLE,
+                        stage=LockStage.VERIFYING_FINAL_PRICE,
                     )
-                if final_total > request.max_total_price:
+                if not final_price_is_safe(final_total, request.max_total_price):
                     return LockOrderResult(
                         LockStatus.PRICE_CHANGED,
                         "订单确认页实际应付金额超过配置上限，已停止提交",
                         final_total=final_total,
                         order_url=safe_page_url(page.url),
                     )
-                if re.search(r"(请选择|添加|填写).{0,8}(观演人|联系人|收货地址|实名)", body):
+                await request.transition(LockStage.SELECTING_AUDIENCE, "核对已保存观演人")
+                if re.search(r"(请选择|添加|填写).{0,8}(观演人|实名)", body):
                     return LockOrderResult(
-                        LockStatus.MANUAL_CONFIRMATION,
-                        "订单确认页需要补充实名、联系人或地址信息",
+                        LockStatus.MANUAL_PROFILE_MISSING,
+                        "票牛观演人选择器尚未通过真实页面验证，请人工选择已保存观演人",
                         final_total=final_total,
                         order_url=safe_page_url(page.url),
                         requires_manual_action=True,
+                        failure_kind=FailureKind.MANUAL_ACTION,
+                        stage=LockStage.SELECTING_AUDIENCE,
+                    )
+                await request.transition(LockStage.SELECTING_CONTACT, "核对已保存联系人和地址")
+                if re.search(r"(请选择|添加|填写).{0,8}(联系人|收货地址)", body):
+                    return LockOrderResult(
+                        LockStatus.MANUAL_PROFILE_MISSING,
+                        "票牛联系人或地址选择器尚未通过真实页面验证，请人工选择已保存资料",
+                        final_total=final_total,
+                        order_url=safe_page_url(page.url),
+                        requires_manual_action=True,
+                        failure_kind=FailureKind.MANUAL_ACTION,
+                        stage=LockStage.SELECTING_CONTACT,
                     )
 
+                await request.transition(LockStage.VERIFYING_FINAL_PRICE, "最终应付金额已读取")
+                await request.transition(LockStage.READY_TO_SUBMIT, "资料与金额校验完成")
+
                 submit = page.get_by_role(
-                    "button", name=re.compile(r"^(提交订单|确认订单|确认下单)$")
+                    "button", name=SAFE_ORDER_SUBMIT_PATTERN
                 ).first
                 if not await submit.count() or not await submit.is_visible():
                     return LockOrderResult(
@@ -182,7 +222,10 @@ class PiaoniuPlatform(TicketPlatform):
                         final_total=final_total,
                         order_url=safe_page_url(page.url),
                         requires_manual_action=True,
+                        failure_kind=FailureKind.MANUAL_ACTION,
+                        stage=LockStage.READY_TO_SUBMIT,
                     )
+                await request.transition(LockStage.SUBMITTING, "提交订单，不进入支付操作")
                 await submit.click()
                 await page.wait_for_timeout(1_500)
                 interruption = await detect_interruption(page)
@@ -197,14 +240,16 @@ class PiaoniuPlatform(TicketPlatform):
                     )
                 result_text = await visible_body_text(page)
                 order_match = re.search(r"订单(?:号|编号)\s*[：:]?\s*([A-Za-z0-9-]+)", result_text)
-                if order_match or "待支付" in result_text or re.search(r"/(?:order|pay)", page.url):
+                if order_match or "待支付" in result_text or "/order/" in page.url:
+                    await request.transition(LockStage.PAYMENT_PENDING, "订单已进入待支付")
                     return LockOrderResult(
-                        LockStatus.SUCCESS,
+                        LockStatus.PAYMENT_PENDING,
                         "票牛订单已提交并停留在待支付阶段，请手动付款",
                         order_id=order_match.group(1) if order_match else None,
                         final_total=final_total,
                         order_url=safe_page_url(page.url),
                         requires_manual_action=True,
+                        stage=LockStage.PAYMENT_PENDING,
                     )
                 return LockOrderResult(
                     LockStatus.MANUAL_CONFIRMATION,
@@ -212,9 +257,15 @@ class PiaoniuPlatform(TicketPlatform):
                     final_total=final_total,
                     order_url=safe_page_url(page.url),
                     requires_manual_action=True,
+                    failure_kind=FailureKind.MANUAL_ACTION,
+                    stage=LockStage.SUBMITTING,
                 )
             except Exception as exc:
-                return LockOrderResult(LockStatus.PAGE_CHANGED, f"票牛页面操作失败：{exc}")
+                return LockOrderResult(
+                    LockStatus.PAGE_CHANGED,
+                    f"票牛页面操作失败：{exc}",
+                    failure_kind=FailureKind.RETRYABLE,
+                )
 
     async def _goto_detail(self, page: Any, url: str) -> None:
         await page.goto(url, wait_until="domcontentloaded")
@@ -350,7 +401,7 @@ class PiaoniuPlatform(TicketPlatform):
         self, page: Any, task: MonitorTask, session_data: dict[str, Any]
     ) -> list[TicketInfo]:
         title = (await page.locator(".main .head .title").first.inner_text()).strip()
-        event_id = task.event_id or event_id_from_url(task.event_url)
+        event_id = event_id_from_url(task.event_url)
         categories = page.locator(".ticket-category .items .item:not(.disabled)")
         result: list[TicketInfo] = []
         for index in range(await categories.count()):
@@ -366,12 +417,12 @@ class PiaoniuPlatform(TicketPlatform):
                 for i in range(await quantities.count())
             ]
             available = max(values, default=0)
-            desired = task.quantity if task.quantity in values else available
-            if desired:
-                await page.locator(
-                    f'.b2c-num-picker .items .item[data-num="{desired}"]:not(.disabled)'
-                ).first.click()
-                await page.wait_for_timeout(100)
+            if task.quantity not in values:
+                continue
+            await page.locator(
+                f'.b2c-num-picker .items .item[data-num="{task.quantity}"]:not(.disabled)'
+            ).first.click()
+            await page.wait_for_timeout(100)
 
             selected_quantity = page.locator(
                 ".b2c-num-picker .items .item.selected[data-ticket-groups]"
@@ -410,6 +461,9 @@ class PiaoniuPlatform(TicketPlatform):
                     total_price=unit_price * task.quantity,
                     available_quantity=available,
                     detail_url=task.event_url,
+                    listing_id=str(group.get("id", "")),
+                    ticket_group_id=str(group.get("id", "")),
+                    seller_id=str(group.get("providerid", "")),
                     area=area_text,
                     stand="看台" if "看台" in area_text else None,
                     row=row_match.group() if row_match else None,
@@ -422,6 +476,7 @@ class PiaoniuPlatform(TicketPlatform):
                         "category_name": level,
                         "ticket_group_id": str(group.get("id", "")),
                         "origin_price": str(group.get("originprice", "")),
+                        "selected_quantity": task.quantity,
                         "idempotency_scope": "piaoniu-default-profile",
                     },
                 )
@@ -445,6 +500,28 @@ class PiaoniuPlatform(TicketPlatform):
             ) == compact_text(category_name):
                 return item
         return None
+
+    async def _selected_ticket_groups(self, page: Any) -> list[dict[str, Any]]:
+        selected = page.locator(
+            ".b2c-num-picker .items .item.selected[data-ticket-groups]"
+        ).first
+        if not await selected.count():
+            return []
+        attributes = await selected.evaluate(
+            "el => Array.from(el.attributes).map(attribute => [attribute.name, attribute.value])"
+        )
+        return parse_ticket_groups(attributes)
+
+    @staticmethod
+    def _active_group(groups: list[dict[str, Any]], visible_price: Decimal) -> dict[str, Any]:
+        """只认可页面当前价格对应的首个票品，避免同名同价时误选其他 ID。"""
+        for group in groups:
+            try:
+                if parse_price(str(group.get("saleprice", ""))) == visible_price:
+                    return group
+            except ValueError:
+                continue
+        return {}
 
     @staticmethod
     def _closest_group(groups: list[dict[str, Any]], unit_price: Decimal) -> dict[str, Any]:

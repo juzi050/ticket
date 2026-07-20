@@ -5,6 +5,7 @@ __pycache__/
 .coverage
 .env
 config.yaml
+purchase_profiles.yaml
 data/*.db
 data/*.db-*
 data/browser_states/*

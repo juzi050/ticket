@@ -57,6 +57,12 @@ class TicketMatcher:
             reasons.append("演出不匹配")
         if task.event_id and task.event_id != ticket.event_id:
             reasons.append("商品编号不匹配")
+        if task.target_session_id and task.target_session_id != ticket.session_id:
+            reasons.append("场次 ID 不匹配")
+        if task.target_listing_id and task.target_listing_id != ticket.listing_id:
+            reasons.append("票品 ID 不匹配")
+        if task.target_ticket_group_id and task.target_ticket_group_id != ticket.ticket_group_id:
+            reasons.append("票组 ID 不匹配")
         if not _text_matches(ticket.session_name, task.target_sessions, task.match_mode):
             reasons.append("场次不匹配")
         if task.event_date and _normalize(task.event_date) not in _normalize(ticket.session_name):

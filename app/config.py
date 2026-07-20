@@ -56,6 +56,67 @@ class MonitorSettings(BaseModel):
         return self
 
 
+class StrictLockSettings(BaseModel):
+    strict_quantity: bool = True
+    strict_session_id: bool = True
+    strict_listing_id: bool = True
+    strict_audience_count: bool = True
+    reject_unknown_final_price: bool = True
+    reject_listing_replacement: bool = True
+    max_price_slippage: Decimal = Field(default=Decimal("0"), ge=0)
+    stop_before_payment: bool = True
+    stage_timeout_seconds: int = Field(default=30, ge=5)
+
+
+class PurchaseAudience(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    name: str = ""
+    platform_option_id: str = ""
+    phone_last4: str = ""
+
+    @model_validator(mode="after")
+    def require_saved_option(self) -> "PurchaseAudience":
+        if not self.name and not self.platform_option_id:
+            raise ValueError("观演人必须填写 name 或 platform_option_id")
+        if self.phone_last4 and not re.fullmatch(r"\d{4}", self.phone_last4):
+            raise ValueError("phone_last4 必须是 4 位数字")
+        return self
+
+
+class PurchaseProfile(BaseModel):
+    """仅保存平台已有选项的引用，不保存身份证、密码或支付信息。"""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    profile_id: str = Field(min_length=1)
+    account_alias: str = Field(min_length=1)
+    audiences: list[PurchaseAudience] = Field(default_factory=list)
+    contact_id: str = ""
+    contact_name: str = ""
+    contact_phone_last4: str = ""
+    address_id: str = ""
+    address_label: str = ""
+    address_phone_last4: str = ""
+    delivery_method: str = ""
+    accept_purchase_notice: bool = False
+
+    @field_validator("contact_phone_last4", "address_phone_last4")
+    @classmethod
+    def validate_phone_last4(cls, value: str) -> str:
+        if value and not re.fullmatch(r"\d{4}", value):
+            raise ValueError("手机号后四位必须是 4 位数字")
+        return value
+
+    @property
+    def has_contact(self) -> bool:
+        return bool(self.contact_id or (self.contact_name and self.contact_phone_last4))
+
+    @property
+    def has_address(self) -> bool:
+        return bool(self.address_id or (self.address_label and self.address_phone_last4))
+
+
 class PlatformAutomationSettings(BaseModel):
     """真实站点可验证的页面规则；为空时适配器会保守地判定为未登录。"""
 
@@ -76,6 +137,9 @@ class MonitorTask(BaseModel):
     event_name: str = Field(min_length=1)
     event_url: str = Field(min_length=1)
     event_id: str = ""
+    target_session_id: str = ""
+    target_listing_id: str = ""
+    target_ticket_group_id: str = ""
     target_sessions: list[str] = Field(default_factory=list)
     event_date: str | None = None
     event_time: str | None = None
@@ -103,6 +167,7 @@ class MonitorTask(BaseModel):
     stop_after_lock_success: bool = True
     max_lock_attempts: int = Field(default=1, ge=1)
     max_consecutive_errors: int | None = Field(default=None, ge=1)
+    purchase_profile_id: str = ""
 
     @field_validator("target_sessions", "target_ticket_levels", "target_areas", "target_stands", "target_seat_positions", "excluded_keywords", "area_regexes")
     @classmethod
@@ -140,6 +205,9 @@ class Settings(BaseModel):
     login: LoginSettings = Field(default_factory=LoginSettings)
     notification: NotificationSettings = Field(default_factory=NotificationSettings)
     monitor: MonitorSettings = Field(default_factory=MonitorSettings)
+    strict_lock: StrictLockSettings = Field(default_factory=StrictLockSettings)
+    purchase_profiles_file: Path = Path("purchase_profiles.yaml")
+    purchase_profiles: list[PurchaseProfile] = Field(default_factory=list)
     platforms: dict[str, PlatformAutomationSettings] = Field(default_factory=dict)
     tasks: list[MonitorTask]
 
@@ -149,7 +217,14 @@ class Settings(BaseModel):
         duplicates = sorted({item for item in ids if ids.count(item) > 1})
         if duplicates:
             raise ValueError(f"task_id 重复：{', '.join(duplicates)}")
+        profile_ids = [profile.profile_id for profile in self.purchase_profiles]
+        duplicate_profiles = sorted({item for item in profile_ids if profile_ids.count(item) > 1})
+        if duplicate_profiles:
+            raise ValueError(f"profile_id 重复：{', '.join(duplicate_profiles)}")
         return self
+
+    def get_purchase_profile(self, profile_id: str) -> PurchaseProfile | None:
+        return next((item for item in self.purchase_profiles if item.profile_id == profile_id), None)
 
 
 def load_settings(path: str | Path = "config.yaml", *, allow_example: bool = False) -> Settings:
@@ -161,6 +236,12 @@ def load_settings(path: str | Path = "config.yaml", *, allow_example: bool = Fal
         raise ConfigurationError(f"配置文件不存在：{config_path}。请先复制 config.example.yaml 为 config.yaml")
     try:
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        profiles_file = Path(raw.get("purchase_profiles_file", "purchase_profiles.yaml"))
+        if not profiles_file.is_absolute():
+            profiles_file = config_path.parent / profiles_file
+        if profiles_file.exists():
+            profile_raw = yaml.safe_load(profiles_file.read_text(encoding="utf-8")) or {}
+            raw["purchase_profiles"] = profile_raw.get("purchase_profiles", profile_raw.get("profiles", []))
         settings = Settings.model_validate(raw)
     except yaml.YAMLError as exc:
         raise ConfigurationError(f"YAML 格式错误：{exc}") from exc

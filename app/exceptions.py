@@ -10,6 +10,10 @@ class PlatformError(TicketMonitorError):
     """平台操作错误。"""
 
 
+class QuantityUnavailableError(PlatformError):
+    """页面不存在用户要求的精确票数。"""
+
+
 class AdapterNotImplementedError(PlatformError):
     """真实平台页面适配尚未完成。"""
 

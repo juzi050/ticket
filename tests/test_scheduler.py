@@ -37,7 +37,9 @@ class OnceFailingMock(MockPlatform):
         return await super().query_tickets(task)  # type: ignore[arg-type]
 
 
-async def test_multi_task_and_error_isolation(sample_task: object, tmp_path: Path) -> None:
+async def test_multi_task_and_error_isolation(
+    sample_task: object, purchase_profile: object, tmp_path: Path
+) -> None:
     good = sample_task.model_copy(update={"task_id": "good"})  # type: ignore[attr-defined]
     bad = sample_task.model_copy(update={"task_id": "bad"})  # type: ignore[attr-defined]
     for task in (good, bad):
@@ -50,6 +52,7 @@ async def test_multi_task_and_error_isolation(sample_task: object, tmp_path: Pat
         notification=NotificationSettings(enabled=True, provider="console", retry_interval_seconds=0),
         monitor=MonitorSettings(random_delay_min_seconds=0, random_delay_max_seconds=0),
         tasks=[good, bad],
+        purchase_profiles=[purchase_profile],  # type: ignore[list-item]
     )
     database = Database(settings.application.database_path)
     await database.initialize()
@@ -57,7 +60,10 @@ async def test_multi_task_and_error_isolation(sample_task: object, tmp_path: Pat
     login = LoginService(settings.login, notifications)
     registry = PlatformRegistry(settings)
     registry._platforms["mock"] = OnceFailingMock()
-    monitor = MonitorService(database, login, OrderService(database, 0), notifications, settings.monitor)
+    monitor = MonitorService(
+        database, login,
+        OrderService(database, 0, settings.purchase_profiles), notifications, settings.monitor,
+    )
     scheduler = Scheduler(settings, database, registry, monitor)
     try:
         await scheduler.run(max_cycles=4)

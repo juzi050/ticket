@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 
@@ -16,6 +17,7 @@ class LoginState(str, Enum):
 
 class LockStatus(str, Enum):
     SUCCESS = "success"
+    PAYMENT_PENDING = "payment_pending"
     IN_PROGRESS = "in_progress"
     NOT_LOGGED_IN = "not_logged_in"
     PRICE_CHANGED = "price_changed"
@@ -27,12 +29,34 @@ class LockStatus(str, Enum):
     CAPTCHA_REQUIRED = "captcha_required"
     SMS_REQUIRED = "sms_required"
     MANUAL_CONFIRMATION = "manual_confirmation"
+    MANUAL_PROFILE_MISSING = "manual_profile_missing"
     ORDER_EXISTS = "order_exists"
     PAGE_CHANGED = "page_changed"
     TIMEOUT = "timeout"
     REJECTED = "rejected"
     ADAPTER_UNAVAILABLE = "adapter_unavailable"
     FAILED = "failed"
+
+
+class LockStage(str, Enum):
+    PREFLIGHT = "PREFLIGHT"
+    WATCHING = "WATCHING"
+    MATCHED = "MATCHED"
+    REVALIDATING = "REVALIDATING"
+    SELECTING_QUANTITY = "SELECTING_QUANTITY"
+    SELECTING_AUDIENCE = "SELECTING_AUDIENCE"
+    SELECTING_CONTACT = "SELECTING_CONTACT"
+    VERIFYING_FINAL_PRICE = "VERIFYING_FINAL_PRICE"
+    READY_TO_SUBMIT = "READY_TO_SUBMIT"
+    SUBMITTING = "SUBMITTING"
+    PAYMENT_PENDING = "PAYMENT_PENDING"
+
+
+class FailureKind(str, Enum):
+    RETRYABLE = "retryable"
+    NON_RETRYABLE = "non_retryable"
+    ORDER_EXISTS = "order_exists"
+    MANUAL_ACTION = "manual_action"
 
 
 @dataclass(slots=True)
@@ -63,6 +87,9 @@ class TicketInfo:
     total_price: Decimal
     available_quantity: int
     detail_url: str
+    listing_id: str = ""
+    ticket_group_id: str = ""
+    seller_id: str = ""
     area: str | None = None
     stand: str | None = None
     row: str | None = None
@@ -105,6 +132,13 @@ class LockOrderRequest:
     max_unit_price: Decimal
     max_total_price: Decimal
     idempotency_key: str
+    account_alias: str = ""
+    purchase_profile: dict[str, Any] = field(default_factory=dict)
+    stage_callback: Callable[[LockStage, str], Awaitable[None]] | None = None
+
+    async def transition(self, stage: LockStage, message: str = "") -> None:
+        if self.stage_callback is not None:
+            await self.stage_callback(stage, message)
 
 
 @dataclass(slots=True)
@@ -116,10 +150,12 @@ class LockOrderResult:
     payment_deadline: datetime | None = None
     order_url: str | None = None
     requires_manual_action: bool = False
+    failure_kind: FailureKind | None = None
+    stage: LockStage | None = None
 
     @property
     def success(self) -> bool:
-        return self.status is LockStatus.SUCCESS
+        return self.status in {LockStatus.SUCCESS, LockStatus.PAYMENT_PENDING}
 
 
 @dataclass(slots=True)
@@ -127,6 +163,24 @@ class NotificationMessage:
     message_type: str
     title: str
     content: str
+
+
+@dataclass(slots=True)
+class PreflightCheck:
+    name: str
+    passed: bool
+    message: str
+
+
+@dataclass(slots=True)
+class PreflightResult:
+    task_id: str
+    checks: list[PreflightCheck]
+    ticket: TicketInfo | None = None
+
+    @property
+    def passed(self) -> bool:
+        return bool(self.checks) and all(check.passed for check in self.checks)
 
 
 @dataclass(slots=True)
