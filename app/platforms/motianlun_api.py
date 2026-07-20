@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
@@ -72,6 +73,45 @@ def parse_sessions(event_id: str, payload: dict[str, Any]) -> list[SessionInfo]:
     ]
 
 
+def parse_tickets(
+    *,
+    event: EventInfo,
+    session: SessionInfo,
+    payload: dict[str, Any],
+) -> list[TicketOption]:
+    result: list[TicketOption] = []
+    for item in payload.get("data", {}).get("sessionTicketList", []):
+        notes = [
+            str(note.get("noteName"))
+            for note in item.get("ticketNoteTags") or []
+            if note.get("noteName")
+        ]
+        area_parts = [item.get("sectorName"), item.get("zoneName")]
+        area = " ".join(str(part) for part in area_parts if part)
+        listing_id = str(item["ticketId"])
+        seat_plan_id = item.get("seatPlanId")
+        result.append(
+            TicketOption(
+                platform="motianlun",
+                event_url=event.event_url,
+                event_id=event.event_id,
+                event_name=event.event_name,
+                session_id=session.session_id,
+                session_name=session.session_name,
+                listing_id=listing_id,
+                ticket_group_id=str(seat_plan_id) if seat_plan_id else None,
+                sku_id=listing_id,
+                ticket_name=str(item.get("ticketTitle") or "摩天轮票品"),
+                area=area or None,
+                seat_description=" / ".join(notes) or None,
+                unit_price=Decimal(str(item["price"])),
+                available_quantity=int(item.get("leftStocks") or 0),
+                raw_data=item,
+            )
+        )
+    return result
+
+
 class MotianlunApi(TicketPlatformApi):
     platform = "motianlun"
 
@@ -116,12 +156,54 @@ class MotianlunApi(TicketPlatformApi):
     async def list_tickets(
         self, event_id: str, session_id: str, quantity: int
     ) -> list[TicketOption]:
-        raise PlatformCapabilityUnavailable("摩天轮票品 API 尚未实现")
+        event = self._event_cache.get(event_id)
+        session = self._session_cache.get((event_id, session_id))
+        if event is None:
+            raise PlatformCapabilityUnavailable("请先通过演出网址解析摩天轮演出")
+        if session is None:
+            await self.list_sessions(event_id)
+            session = self._session_cache.get((event_id, session_id))
+        if session is None:
+            return []
+
+        city_id = str(event.raw_data.get("cityOID") or "3301")
+        offset = 0
+        tickets: list[TicketOption] = []
+        while True:
+            common = _common_params()
+            payload = await self._request_json(
+                "POST",
+                f"{BASE_URL}/showapi/pub/show_session/v2/find_tickets",
+                action="list_tickets",
+                params=common,
+                json_body={
+                    **common,
+                    "offset": offset,
+                    "length": 20,
+                    "ticketNumber": quantity,
+                    "showSessionId": session_id,
+                    "locationCityOID": city_id,
+                    "ticketSortType": "TICKET_PRICE_ASC",
+                    "zoneIdList": [],
+                    "seatPlanId": "",
+                },
+            )
+            tickets.extend(parse_tickets(event=event, session=session, payload=payload))
+            page = payload.get("data") or {}
+            total = int(page.get("total") or 0)
+            next_offset = int(page.get("lastOffset") or total)
+            if next_offset <= offset or next_offset >= total:
+                break
+            offset = next_offset
+        return tickets
 
     async def get_exact_ticket(
         self, ticket: TicketOption, quantity: int
     ) -> TicketOption | None:
-        raise PlatformCapabilityUnavailable("摩天轮票品 API 尚未实现")
+        current = await self.list_tickets(ticket.event_id, ticket.session_id, quantity)
+        return next(
+            (item for item in current if item.listing_id == ticket.listing_id), None
+        )
 
     async def ensure_remote_buyers(self, buyers: list[BuyerProfile]) -> list[str]:
         raise PlatformCapabilityUnavailable("摩天轮购票人 API 尚未完成登录后验证")

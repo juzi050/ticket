@@ -47,6 +47,8 @@ async def test_real_motianlun_event(tmp_path) -> None:
     try:
         event = await api.get_event(MOTIANLUN_EVENT_URL)
         sessions = await api.list_sessions(event.event_id)
+        tickets = await api.list_tickets(event.event_id, sessions[0].session_id, 1)
+        exact = await api.get_exact_ticket(tickets[0], 1)
     finally:
         await api.close()
 
@@ -54,3 +56,6 @@ async def test_real_motianlun_event(tmp_path) -> None:
     assert "洛天依" in event.event_name
     assert sessions
     assert all(session.event_id == event.event_id for session in sessions)
+    assert tickets
+    assert all(ticket.event_id == event.event_id for ticket in tickets)
+    assert exact is not None and exact.listing_id == tickets[0].listing_id
