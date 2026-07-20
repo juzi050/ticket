@@ -5,7 +5,11 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from app.domain import MonitorTask, PlatformName, TicketOption, utc_now
-from app.platforms.http_api import PlatformAuthExpiredError, TicketPlatformApi
+from app.platforms.http_api import (
+    PlatformAuthExpiredError,
+    PlatformCapabilityUnavailable,
+    TicketPlatformApi,
+)
 from app.storage.audit_repository import AuditEntry, AuditRepository
 from app.storage.task_repository import TaskRepository
 
@@ -80,7 +84,7 @@ class PriceMonitorService:
         evaluation = evaluate_price(task, ticket)
         await self.tasks.update_runtime(
             task.task_id,
-            status=evaluation.status,
+            status="order_preparing" if evaluation.matched else evaluation.status,
             last_unit_price=ticket.unit_price if ticket else None,
             last_estimated_total=evaluation.estimated_total,
             last_final_total=task.last_final_total,
@@ -109,4 +113,41 @@ class PriceMonitorService:
             )
         )
         if evaluation.matched and ticket and self.matched_callback:
-            await self.matched_callback(task, ticket)
+            try:
+                await self.matched_callback(task, ticket)
+            except PlatformAuthExpiredError as exc:
+                await self._stop_failed_order(task, "auth_expired", exc)
+            except PlatformCapabilityUnavailable as exc:
+                await self._stop_failed_order(task, "order_unavailable", exc)
+            except Exception as exc:
+                current = await self.tasks.get(task.task_id)
+                if current is None or current.enabled:
+                    await self._stop_failed_order(task, "order_failed", exc)
+
+    async def _stop_failed_order(
+        self, task: MonitorTask, status: str, error: Exception
+    ) -> None:
+        current = await self.tasks.get(task.task_id) or task
+        await self.tasks.update_runtime(
+            task.task_id,
+            status=status,
+            last_unit_price=current.last_unit_price,
+            last_estimated_total=current.last_estimated_total,
+            last_final_total=current.last_final_total,
+            last_checked_at=current.last_checked_at,
+            next_check_at=None,
+            last_error=str(error),
+        )
+        await self.tasks.set_enabled(task.task_id, False, status)
+        await self.audit.append(
+            AuditEntry(
+                level="ERROR",
+                category="order",
+                action=status,
+                platform=task.ticket.platform,
+                task_id=task.task_id,
+                message="命中价格后的下单流程失败，任务已暂停",
+                exception_type=type(error).__name__,
+                exception_message=str(error),
+            )
+        )
