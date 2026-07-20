@@ -19,6 +19,7 @@ from app.platforms.http_api import TicketPlatformApi
 from app.platforms.motianlun_api import MotianlunApi
 from app.platforms.piaoniu_api import PiaoniuApi
 from app.services.price_monitor_service import PriceMonitorService
+from app.services.order_coordinator import OrderCoordinator
 from app.settings import AppSettings
 from app.storage.audit_repository import AuditEntry, AuditRepository
 from app.storage.buyer_repository import BuyerBindingRepository, BuyerRepository
@@ -54,7 +55,20 @@ class MvpApplication:
         self.notifier = ServerChanNotifier(
             self.audit, sendkey=self.settings.serverchan_sendkey
         )
-        self.monitor = PriceMonitorService(self.apis, self.tasks, self.audit)
+        self.order_coordinator = OrderCoordinator(
+            self.apis,
+            self.buyers,
+            self.tasks,
+            self.orders,
+            self.audit,
+            self.notifier,
+        )
+        self.monitor = PriceMonitorService(
+            self.apis,
+            self.tasks,
+            self.audit,
+            matched_callback=self.order_coordinator.handle_price_match,
+        )
         self.scheduler = MonitorScheduler(
             self.tasks, self.audit, self.monitor.check_once
         )
