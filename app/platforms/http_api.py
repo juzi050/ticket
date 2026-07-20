@@ -55,11 +55,13 @@ class TicketPlatformApi(ABC):
         action: str,
         params: dict[str, Any] | None = None,
         json_body: Any = None,
+        headers: dict[str, str] | None = None,
+        redact_request_body: bool = False,
         requires_auth: bool = False,
     ) -> Any:
         try:
             response = await self.client.request(
-                method, url, params=params, json=json_body
+                method, url, params=params, json=json_body, headers=headers
             )
             is_json = "json" in response.headers.get("content-type", "").lower()
             if is_json:
@@ -80,7 +82,7 @@ class TicketPlatformApi(ABC):
                     request_url=str(response.request.url),
                     request_method=method.upper(),
                     request_headers=dict(response.request.headers),
-                    request_body=json_body,
+                    request_body="[REDACTED]" if redact_request_body else json_body,
                     response_status=response.status_code,
                     response_headers=dict(response.headers),
                     response_body=body,
@@ -106,7 +108,7 @@ class TicketPlatformApi(ABC):
                     message="平台 HTTP 请求失败",
                     request_url=url,
                     request_method=method.upper(),
-                    request_body=json_body,
+                    request_body="[REDACTED]" if redact_request_body else json_body,
                     exception_type=type(exc).__name__,
                     exception_message=str(exc),
                 )
