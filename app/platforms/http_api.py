@@ -16,6 +16,7 @@ from app.domain import (
     TicketOption,
 )
 from app.storage.audit_repository import AuditEntry, AuditRepository
+from app.storage.buyer_repository import BuyerBindingRepository
 from app.storage.session_repository import PlatformSessionRepository
 
 
@@ -39,10 +40,12 @@ class TicketPlatformApi(ABC):
         client: httpx.AsyncClient,
         audit_repository: AuditRepository,
         session_repository: PlatformSessionRepository | None = None,
+        buyer_binding_repository: BuyerBindingRepository | None = None,
     ) -> None:
         self.client = client
         self.audit = audit_repository
         self.sessions = session_repository
+        self.buyer_bindings = buyer_binding_repository
 
     async def _request_json(
         self,

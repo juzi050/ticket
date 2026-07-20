@@ -21,7 +21,7 @@ from app.platforms.piaoniu_api import PiaoniuApi
 from app.services.price_monitor_service import PriceMonitorService
 from app.settings import AppSettings
 from app.storage.audit_repository import AuditEntry, AuditRepository
-from app.storage.buyer_repository import BuyerRepository
+from app.storage.buyer_repository import BuyerBindingRepository, BuyerRepository
 from app.storage.database import MvpDatabase
 from app.storage.order_repository import OrderRepository
 from app.storage.session_repository import PlatformSessionRepository
@@ -40,6 +40,7 @@ class MvpApplication:
         self.runner.submit(self.database.initialize()).result(timeout=15)
         self.audit = AuditRepository(self.database)
         self.buyers = BuyerRepository(self.database)
+        self.buyer_bindings = BuyerBindingRepository(self.database)
         self.tasks = TaskRepository(self.database)
         self.orders = OrderRepository(self.database)
         self.sessions = PlatformSessionRepository(self.database)
@@ -75,7 +76,9 @@ class MvpApplication:
                     timeout=20,
                 )
             )
-            result[platform] = API_TYPES[platform](client, self.audit, self.sessions)
+            result[platform] = API_TYPES[platform](
+                client, self.audit, self.sessions, self.buyer_bindings
+            )
         return result
 
     def _configure_root(self) -> None:
@@ -171,7 +174,9 @@ class MvpApplication:
         async def operation() -> AuthSession:
             async def verify(session: AuthSession) -> bool:
                 client = self.bridge.build_http_client(session)
-                api = API_TYPES[platform](client, self.audit, self.sessions)
+                api = API_TYPES[platform](
+                    client, self.audit, self.sessions, self.buyer_bindings
+                )
                 try:
                     return await api.check_auth()
                 finally:
@@ -204,7 +209,9 @@ class MvpApplication:
                 timeout=20,
             )
         )
-        self.apis[platform] = API_TYPES[platform](client, self.audit, self.sessions)
+        self.apis[platform] = API_TYPES[platform](
+            client, self.audit, self.sessions, self.buyer_bindings
+        )
 
     def close(self) -> None:
         async def shutdown() -> None:

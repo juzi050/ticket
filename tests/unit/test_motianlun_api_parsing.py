@@ -1,6 +1,14 @@
 from decimal import Decimal
 
-from app.platforms.motianlun_api import _show_id, parse_event, parse_sessions, parse_tickets
+from app.domain import BuyerProfile
+from app.platforms.motianlun_api import (
+    _matching_audience,
+    _price_totals,
+    _show_id,
+    parse_event,
+    parse_sessions,
+    parse_tickets,
+)
 
 
 def test_parse_motianlun_event() -> None:
@@ -59,3 +67,39 @@ def test_parse_motianlun_event() -> None:
     assert tickets[0].listing_id == "ticket-1"
     assert tickets[0].unit_price == Decimal("278")
     assert tickets[0].available_quantity == 2
+
+
+def test_matches_remote_audience_by_exact_identity() -> None:
+    buyer = BuyerProfile(
+        name="测试用户",
+        certificate_type="身份证",
+        certificate_number="000000000000000000",
+        phone="13000000000",
+    )
+    audience = {
+        "id": "audience-1",
+        "name": "测试用户",
+        "idType": "ID_CARD",
+        "idNo": "000000000000000000",
+        "enable": True,
+        "isValid": True,
+    }
+
+    assert _matching_audience(buyer, [audience]) == audience
+    assert _matching_audience(
+        buyer, [{**audience, "idNo": "000000000000000001"}]
+    ) is None
+
+
+def test_calculates_final_total_from_official_fee_items() -> None:
+    ticket_total, fee_total, final_total = _price_totals(
+        [
+            {"itemType": "TICKET_PRICE", "amount": 1056},
+            {"itemType": "SERVICE_FEE", "amount": 52.8},
+            {"itemType": "COUPON_DISCOUNT", "amount": 10},
+        ]
+    )
+
+    assert ticket_total == Decimal("1056")
+    assert fee_total == Decimal("42.8")
+    assert final_total == Decimal("1098.8")
