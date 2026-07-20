@@ -12,9 +12,12 @@ from app.storage.audit_repository import AuditEntry, AuditRepository
 from app.storage.session_repository import PlatformSessionRepository
 
 
-PLATFORM_HOME_URLS: dict[PlatformName, str] = {
+PLATFORM_LOGIN_URLS: dict[PlatformName, str] = {
     "piaoniu": "https://www.piaoniu.com/",
-    "motianlun": "https://m.motianlun.cn/",
+    "motianlun": (
+        "https://m.motianlun.cn/package-functional-pages/"
+        "account-login/account-login"
+    ),
 }
 
 
@@ -47,8 +50,6 @@ class PlaywrightLoginService:
         self,
         platform: PlatformName,
         verify_session: Callable[[AuthSession], Awaitable[bool]],
-        *,
-        landing_url: str | None = None,
     ) -> AuthSession:
         lock = self._locks.setdefault(platform, asyncio.Lock())
         async with lock:
@@ -61,16 +62,12 @@ class PlaywrightLoginService:
                     message="用户主动打开官方登录窗口",
                 )
             )
-            return await self._run_browser_login(
-                platform, verify_session, landing_url=landing_url
-            )
+            return await self._run_browser_login(platform, verify_session)
 
     async def _run_browser_login(
         self,
         platform: PlatformName,
         verify_session: Callable[[AuthSession], Awaitable[bool]],
-        *,
-        landing_url: str | None,
     ) -> AuthSession:
         from playwright.async_api import async_playwright
 
@@ -86,10 +83,14 @@ class PlaywrightLoginService:
                 locale="zh-CN",
             )
             page = context.pages[0] if context.pages else await context.new_page()
-            await page.goto(
-                landing_url or PLATFORM_HOME_URLS[platform],
-                wait_until="domcontentloaded",
-            )
+            await page.goto(PLATFORM_LOGIN_URLS[platform], wait_until="domcontentloaded")
+            if platform == "piaoniu":
+                login_button = page.locator(".right-funcs .item-login:visible").first
+                await login_button.wait_for(state="visible", timeout=15_000)
+                await login_button.click()
+                await page.locator(".light-login:visible").first.wait_for(
+                    state="visible", timeout=15_000
+                )
             loop = asyncio.get_running_loop()
             deadline = loop.time() + self.options.timeout_seconds
             last_error: Exception | None = None

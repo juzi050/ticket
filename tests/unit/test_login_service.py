@@ -1,10 +1,13 @@
-from app.auth.login_service import PLATFORM_HOME_URLS, LoginOptions
+from app.auth.login_service import PLATFORM_LOGIN_URLS, LoginOptions
 
 
-def test_login_service_uses_official_home_pages() -> None:
-    assert PLATFORM_HOME_URLS == {
+def test_login_service_uses_official_login_pages() -> None:
+    assert PLATFORM_LOGIN_URLS == {
         "piaoniu": "https://www.piaoniu.com/",
-        "motianlun": "https://m.motianlun.cn/",
+        "motianlun": (
+            "https://m.motianlun.cn/package-functional-pages/"
+            "account-login/account-login"
+        ),
     }
 
 

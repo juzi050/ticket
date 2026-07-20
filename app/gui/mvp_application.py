@@ -169,13 +169,6 @@ class MvpApplication:
 
     def login(self, platform: PlatformName):
         async def operation() -> AuthSession:
-            tasks = [
-                task
-                for task in await self.tasks.list()
-                if task.ticket.platform == platform
-            ]
-            landing_url = tasks[0].ticket.event_url if tasks else None
-
             async def verify(session: AuthSession) -> bool:
                 client = self.bridge.build_http_client(session)
                 api = API_TYPES[platform](client, self.audit, self.sessions)
@@ -184,9 +177,7 @@ class MvpApplication:
                 finally:
                     await api.close()
 
-            session = await self.login_service.login(
-                platform, verify, landing_url=landing_url
-            )
+            session = await self.login_service.login(platform, verify)
             await self._replace_api(platform, session)
             return session
 
