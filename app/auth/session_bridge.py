@@ -11,6 +11,10 @@ from app.domain import AuthSession, PlatformName, utc_now
 
 CSRF_MARKERS = ("csrf", "xsrf")
 DEVICE_MARKERS = ("device", "deviceid", "did", "fingerprint", "uuid")
+MOTIANLUN_STORAGE_HEADERS = {
+    "auth$_$local_token": "Access-Token",
+    "auth$_$local_tsid": "TSessionId",
+}
 
 
 def _first_matching_value(
@@ -68,6 +72,20 @@ class AuthSessionBridge:
             parsed = urlsplit(current_url)
             if parsed.scheme and parsed.netloc:
                 headers["Origin"] = f"{parsed.scheme}://{parsed.netloc}"
+
+        if platform == "motianlun":
+            for storage_key, header_name in MOTIANLUN_STORAGE_HEADERS.items():
+                value = storage.get(storage_key)
+                if value:
+                    headers[header_name] = value
+            headers.update(
+                {
+                    "X-Requested-With": "XMLHttpRequest",
+                    "source": "m_web",
+                    "src": "m_web",
+                    "ver": "6.76.1",
+                }
+            )
 
         candidates = {**cookies, **storage}
         return AuthSession(
