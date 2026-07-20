@@ -6,7 +6,13 @@ from decimal import Decimal
 from tkinter import messagebox, ttk
 from typing import Any
 
-from app.domain import BuyerProfile, MonitorTask, PlatformName, TicketOption
+from app.domain import (
+    BuyerProfile,
+    MonitorTask,
+    PlatformName,
+    SessionInfo,
+    TicketOption,
+)
 from app.gui.async_runner import AsyncRunner
 from app.platform_url import detect_platform
 from app.platforms.http_api import TicketPlatformApi
@@ -24,6 +30,16 @@ def ticket_choice_label(ticket: TicketOption) -> str:
         f"{ticket.ticket_name}{area} · ¥{ticket.unit_price} · "
         f"余量 {ticket.available_quantity} · {ticket.listing_id}"
     )
+
+
+def preferred_ticket_label(
+    tickets: dict[str, TicketOption], preferred_listing_id: str | None
+) -> str:
+    if preferred_listing_id:
+        for label, ticket in tickets.items():
+            if ticket.listing_id == preferred_listing_id:
+                return label
+    return next(iter(tickets), "")
 
 
 def build_monitor_task(
@@ -103,9 +119,20 @@ class MvpTaskEditor(tk.Toplevel):
             value=str(task.query_interval_seconds) if task else "10"
         )
         if task:
+            self.sessions[self.session_var.get()] = SessionInfo(
+                platform=task.ticket.platform,
+                event_id=task.ticket.event_id,
+                session_id=task.ticket.session_id,
+                session_name=task.ticket.session_name,
+            )
             self.tickets[self.ticket_var.get()] = task.ticket
         self._build()
+        if task:
+            self.session_combo.configure(values=list(self.sessions))
+            self.ticket_combo.configure(values=list(self.tickets))
         self._load_buyers()
+        if task:
+            self.after(50, self._discover)
 
     def _build(self) -> None:
         shell = ttk.Frame(self, padding=20)
@@ -216,10 +243,15 @@ class MvpTaskEditor(tk.Toplevel):
 
     def _render_event(self, result) -> None:
         event, sessions = result
+        previous_session = self.session_var.get()
         self.event_var.set(event.event_name)
         self.sessions = {session.session_name: session for session in sessions}
         self.session_combo.configure(values=list(self.sessions))
-        self.session_var.set(next(iter(self.sessions), ""))
+        self.session_var.set(
+            previous_session
+            if previous_session in self.sessions
+            else next(iter(self.sessions), "")
+        )
         self._load_tickets()
 
     def _load_tickets(self) -> None:
@@ -240,10 +272,13 @@ class MvpTaskEditor(tk.Toplevel):
         self._poll(self.runner.submit(load()), self._render_tickets)
 
     def _render_tickets(self, tickets: list[TicketOption]) -> None:
+        preferred_listing_id = self.task.ticket.listing_id if self.task else None
         self.tickets = {ticket_choice_label(ticket): ticket for ticket in tickets}
         values = list(self.tickets)
         self.ticket_combo.configure(values=values)
-        self.ticket_var.set(values[0] if values else "")
+        self.ticket_var.set(
+            preferred_ticket_label(self.tickets, preferred_listing_id)
+        )
         if not values:
             messagebox.showinfo("暂无票品", "当前场次和数量没有可选票品。", parent=self)
 

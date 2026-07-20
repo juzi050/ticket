@@ -37,6 +37,7 @@ class LoginPanel(ttk.Frame):
         self.sessions = session_repository
         self.login_callback = login_callback
         self.clear_callback = clear_callback
+        self._refresh_generation = 0
         self.status_vars = {
             platform: tk.StringVar(value="检查中…")
             for platform in ("piaoniu", "motianlun")
@@ -72,6 +73,9 @@ class LoginPanel(ttk.Frame):
             ).grid(row=row, column=3, pady=7)
 
     def refresh(self) -> None:
+        self._refresh_generation += 1
+        generation = self._refresh_generation
+
         async def load() -> dict[PlatformName, str]:
             return {
                 platform: await self.sessions.status(platform)
@@ -79,14 +83,22 @@ class LoginPanel(ttk.Frame):
             }
 
         def render(statuses: dict[PlatformName, str]) -> None:
+            if generation != self._refresh_generation:
+                return
             for platform, status in statuses.items():
                 self.status_vars[platform].set(display_login_status(status))
 
         self._poll(self.runner.submit(load()), render)
 
     def login(self, platform: PlatformName) -> None:
+        self._refresh_generation += 1
         self.status_vars[platform].set("等待人工登录…")
-        self._poll(self.login_callback(platform), lambda _session: self.refresh())
+
+        def completed(_session) -> None:
+            self.status_vars[platform].set("已登录")
+            self.refresh()
+
+        self._poll(self.login_callback(platform), completed)
 
     def clear(self, platform: PlatformName) -> None:
         if not messagebox.askyesno(
