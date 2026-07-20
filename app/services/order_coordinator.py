@@ -114,6 +114,27 @@ class OrderCoordinator:
                 )
                 return None
 
+            recent = await api.find_recent_order(task)
+            if recent is not None and recent.status == "payment_pending":
+                claimed, existing = await self.orders.claim_creating(task, preview)
+                if claimed:
+                    await self.orders.save_result(
+                        build_idempotency_key(task), recent
+                    )
+                await self.tasks.set_enabled(task.task_id, False, "payment_pending")
+                await self.audit.append(
+                    AuditEntry(
+                        level="WARNING",
+                        category="order",
+                        action="platform_order_reused",
+                        platform=task.ticket.platform,
+                        task_id=task.task_id,
+                        order_id=recent.order_id,
+                        message="平台已存在相同待支付订单，已阻止再次创建",
+                    )
+                )
+                return existing.result if existing and existing.result else recent
+
             claimed, existing = await self.orders.claim_creating(task, preview)
             if not claimed:
                 await self.tasks.set_enabled(
