@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
 
@@ -62,11 +63,18 @@ class ServerChanNotifier:
             return False
         response: httpx.Response | None = None
         try:
-            response = await self.client.post(
-                f"https://sctapi.ftqq.com/{self.sendkey}.send",
-                data={
+            form_body = urlencode(
+                {
                     "title": f"抢票成功：{task.ticket.event_name}",
                     "desp": build_success_message(task, result),
+                },
+                encoding="utf-8",
+            ).encode("ascii")
+            response = await self.client.post(
+                f"https://sctapi.ftqq.com/{self.sendkey}.send",
+                content=form_body,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded; charset=utf-8"
                 },
             )
             response.raise_for_status()
