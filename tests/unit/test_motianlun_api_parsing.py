@@ -1,7 +1,12 @@
 from decimal import Decimal
+from unittest.mock import AsyncMock, Mock
 
-from app.domain import BuyerProfile
+import httpx
+import pytest
+
+from app.domain import BuyerProfile, TicketOption
 from app.platforms.motianlun_api import (
+    MotianlunApi,
     _create_order_body,
     _deadline_from_reserve_time,
     _matching_audience,
@@ -9,6 +14,7 @@ from app.platforms.motianlun_api import (
     _price_totals,
     _show_id,
     parse_event,
+    parse_exact_ticket,
     parse_sessions,
     parse_tickets,
 )
@@ -70,6 +76,91 @@ def test_parse_motianlun_event() -> None:
     assert tickets[0].listing_id == "ticket-1"
     assert tickets[0].unit_price == Decimal("278")
     assert tickets[0].available_quantity == 2
+
+
+def exact_ticket() -> TicketOption:
+    return TicketOption(
+        platform="motianlun",
+        event_url="https://m.motianlun.cn/pages/show-detail/show-detail?showId=show-1",
+        event_id="show-1",
+        event_name="测试演出",
+        session_id="session-1",
+        session_name="测试场次",
+        listing_id="ticket-1",
+        ticket_group_id="plan-1",
+        ticket_name="980票面 看台",
+        unit_price=Decimal("1056"),
+        available_quantity=4,
+    )
+
+
+def test_parse_exact_ticket_uses_requested_quantity_when_detail_omits_stock() -> None:
+    current = parse_exact_ticket(
+        reference=exact_ticket(),
+        quantity=2,
+        payload={
+            "statusCode": 200,
+            "data": {
+                "show": {"showId": "show-1"},
+                "session": {"sessionId": "session-1"},
+                "seatPlan": {"seatPlanId": "plan-1"},
+                "ticket": {
+                    "ticketId": "ticket-1",
+                    "ticketTitle": "980票面 看台",
+                    "price": 999,
+                },
+            },
+        },
+    )
+
+    assert current is not None
+    assert current.listing_id == "ticket-1"
+    assert current.unit_price == Decimal("999")
+    assert current.available_quantity == 2
+
+
+def test_parse_exact_ticket_rejects_changed_identity() -> None:
+    current = parse_exact_ticket(
+        reference=exact_ticket(),
+        quantity=1,
+        payload={
+            "statusCode": 200,
+            "data": {
+                "show": {"showId": "show-1"},
+                "session": {"sessionId": "session-1"},
+                "seatPlan": {"seatPlanId": "plan-1"},
+                "ticket": {"ticketId": "another-ticket", "price": 999},
+            },
+        },
+    )
+
+    assert current is None
+
+
+@pytest.mark.asyncio
+async def test_get_exact_ticket_uses_ticket_detail_instead_of_random_listing() -> None:
+    api = MotianlunApi(httpx.AsyncClient(), Mock())
+    api._request_json = AsyncMock(
+        return_value={
+            "statusCode": 200,
+            "data": {
+                "show": {"showId": "show-1"},
+                "session": {"sessionId": "session-1"},
+                "seatPlan": {"seatPlanId": "plan-1"},
+                "ticket": {"ticketId": "ticket-1", "price": 1056},
+            },
+        }
+    )
+
+    try:
+        current = await api.get_exact_ticket(exact_ticket(), 1)
+    finally:
+        await api.close()
+
+    assert current is not None
+    request = api._request_json.await_args
+    assert request.kwargs["action"] == "get_exact_ticket"
+    assert request.kwargs["json_body"] == {"id": "ticket-1"}
 
 
 def test_matches_remote_audience_by_exact_identity() -> None:

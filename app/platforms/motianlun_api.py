@@ -125,6 +125,53 @@ def parse_tickets(
     return result
 
 
+def parse_exact_ticket(
+    *, reference: TicketOption, payload: dict[str, Any], quantity: int
+) -> TicketOption | None:
+    data = _business_data(payload, "查询精确票品") or {}
+    show = data.get("show") or {}
+    session = data.get("session") or {}
+    seat_plan = data.get("seatPlan") or {}
+    current = data.get("ticket") or {}
+    expected_ids = (
+        str(show.get("showId") or "") == reference.event_id,
+        str(session.get("sessionId") or "") == reference.session_id,
+        str(current.get("ticketId") or "") == reference.listing_id,
+        reference.ticket_group_id is None
+        or str(seat_plan.get("seatPlanId") or "") == reference.ticket_group_id,
+    )
+    if not current or not all(expected_ids) or current.get("price") is None:
+        return None
+
+    raw_data = {**reference.raw_data, **current}
+    raw_data.update(
+        {
+            "seatPlanId": seat_plan.get("seatPlanId"),
+            "sessionId": session.get("sessionId"),
+            "showId": show.get("showId"),
+        }
+    )
+    stock = current.get("leftStocks")
+    available_quantity = int(stock) if stock is not None else quantity
+    area_parts = [current.get("sectorName"), current.get("zoneName")]
+    area = " ".join(str(part) for part in area_parts if part)
+    notes = [
+        str(note.get("noteName"))
+        for note in current.get("ticketNoteTags") or []
+        if note.get("noteName")
+    ]
+    return reference.model_copy(
+        update={
+            "ticket_name": str(current.get("ticketTitle") or reference.ticket_name),
+            "area": area or reference.area,
+            "seat_description": " / ".join(notes) or reference.seat_description,
+            "unit_price": Decimal(str(current["price"])),
+            "available_quantity": available_quantity,
+            "raw_data": raw_data,
+        }
+    )
+
+
 def _business_data(payload: dict[str, Any], action: str) -> Any:
     status_code = payload.get("statusCode")
     if status_code not in {0, 200}:
@@ -394,13 +441,15 @@ class MotianlunApi(TicketPlatformApi):
     async def get_exact_ticket(
         self, ticket: TicketOption, quantity: int
     ) -> TicketOption | None:
-        if ticket.event_id not in self._event_cache:
-            await self.get_event(ticket.event_url)
-        if (ticket.event_id, ticket.session_id) not in self._session_cache:
-            await self.list_sessions(ticket.event_id)
-        current = await self.list_tickets(ticket.event_id, ticket.session_id, quantity)
-        return next(
-            (item for item in current if item.listing_id == ticket.listing_id), None
+        payload = await self._request_json(
+            "POST",
+            f"{BASE_URL}/showapi/pub/show/v1/find_show_ticket_by_ticket_id",
+            action="get_exact_ticket",
+            params=_common_params(),
+            json_body={"id": ticket.listing_id},
+        )
+        return parse_exact_ticket(
+            reference=ticket, payload=payload, quantity=quantity
         )
 
     async def _service_key(self) -> str:
