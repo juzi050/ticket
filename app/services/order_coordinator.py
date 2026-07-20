@@ -133,7 +133,10 @@ class OrderCoordinator:
                         message="平台已存在相同待支付订单，已阻止再次创建",
                     )
                 )
-                return existing.result if existing and existing.result else recent
+                result = existing.result if existing and existing.result else recent
+                if claimed:
+                    await self.notifier.notify_order(task, result)
+                return result
 
             claimed, existing = await self.orders.claim_creating(task, preview)
             if not claimed:

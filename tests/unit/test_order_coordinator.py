@@ -91,7 +91,7 @@ async def test_reuses_platform_pending_order_before_create() -> None:
     tasks.set_enabled.assert_awaited_once_with(
         monitor_task.task_id, False, "payment_pending"
     )
-    notifier.notify_order.assert_not_awaited()
+    notifier.notify_order.assert_awaited_once_with(monitor_task, pending)
 
 
 async def test_platform_pending_order_wins_over_concurrent_empty_local_claim() -> None:

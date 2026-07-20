@@ -9,6 +9,7 @@ from app.auth import AuthSessionBridge
 from app.notifications.serverchan import ServerChanNotifier
 from app.platforms.motianlun_api import MotianlunApi
 from app.services.order_coordinator import OrderCoordinator
+from app.settings import AppSettings
 from app.storage.audit_repository import AuditRepository
 from app.storage.buyer_repository import BuyerBindingRepository, BuyerRepository
 from app.storage.database import MvpDatabase
@@ -61,7 +62,9 @@ async def test_real_motianlun_pending_order() -> None:
         sessions,
         BuyerBindingRepository(database),
     )
-    notifier = ServerChanNotifier(audit, sendkey="")
+    notifier = ServerChanNotifier(
+        audit, sendkey=AppSettings.load().serverchan_sendkey
+    )
     try:
         event = await api.get_event(event_url)
         sessions_for_event = await api.list_sessions(event.event_id)
