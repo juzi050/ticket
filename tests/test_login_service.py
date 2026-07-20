@@ -15,7 +15,7 @@ from app.notifier import Notifier
 from app.platforms.base import TicketPlatform
 from app.services.login_service import LoginService
 from app.services.notification_service import NotificationService
-from app.services.session_service import BrowserSessionService
+from app.services.session_service import BrowserSessionService, sanitize_storage_state
 
 
 class SilentNotifier(Notifier):
@@ -102,6 +102,31 @@ class StatePage:
         self.reloads += 1
 
 
+def test_storage_state_drops_raw_phone_and_identity() -> None:
+    state = {
+        "cookies": [
+            {"name": "session", "value": "safe-token"},
+            {"name": "profile", "value": "mobile=13900001234"},
+        ],
+        "origins": [
+            {
+                "origin": "https://example.com",
+                "localStorage": [
+                    {"name": "auth", "value": "safe"},
+                    {"name": "audience", "value": "110101199001011234"},
+                ],
+            }
+        ],
+    }
+
+    sanitized = sanitize_storage_state(state)
+
+    assert [item["name"] for item in sanitized["cookies"]] == ["session"]
+    assert [
+        item["name"] for item in sanitized["origins"][0]["localStorage"]
+    ] == ["auth"]
+
+
 async def test_browser_session_restores_storage_state(tmp_path: Path) -> None:
     automation = PlatformAutomationSettings(home_url="https://example.com/")
     service = BrowserSessionService("test", BrowserSettings(), automation, data_dir=tmp_path)
@@ -109,11 +134,17 @@ async def test_browser_session_restores_storage_state(tmp_path: Path) -> None:
     service.state_file.write_text(
         json.dumps(
             {
-                "cookies": [{"name": "session", "value": "private", "domain": "example.com", "path": "/"}],
+                "cookies": [
+                    {"name": "session", "value": "private", "domain": "example.com", "path": "/"},
+                    {"name": "profile", "value": "mobile=13900001234", "domain": "example.com", "path": "/"},
+                ],
                 "origins": [
                     {
                         "origin": "https://example.com",
-                        "localStorage": [{"name": "logged-in", "value": "yes"}],
+                        "localStorage": [
+                            {"name": "logged-in", "value": "yes"},
+                            {"name": "audience", "value": "110101199001011234"},
+                        ],
                     }
                 ],
             }
@@ -131,3 +162,6 @@ async def test_browser_session_restores_storage_state(tmp_path: Path) -> None:
     assert page.urls == ["https://example.com"]
     assert page.entries == [{"name": "logged-in", "value": "yes"}]
     assert page.reloads == 1
+    persisted = service.state_file.read_text(encoding="utf-8")
+    assert "13900001234" not in persisted
+    assert "110101199001011234" not in persisted

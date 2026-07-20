@@ -178,15 +178,20 @@ async def test_cache_clear_removes_tasks_login_files_cache_and_private_config(
         target.write_text("private", encoding="utf-8")
     env_file = tmp_path / ".env"
     profile_file = tmp_path / "purchase_profiles.yaml"
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    log_file = log_dir / "ticket_monitor.log"
+    log_file.write_text("runtime log", encoding="utf-8")
     env_file.write_text("TOKEN=secret", encoding="utf-8")
     profile_file.write_text("profiles: []", encoding="utf-8")
     await CacheCleaner(
-        database, data_dir, private_files=(env_file, profile_file)
+        database, data_dir, log_dir=log_dir, private_files=(env_file, profile_file)
     ).clear()
     assert await database.load_tasks() == []
     assert await database.list_ticket_cache() == []
     assert not env_file.exists()
     assert not profile_file.exists()
+    assert not log_file.exists()
     for name in ("browser_states", "browser_profiles", "cache"):
         assert (data_dir / name).is_dir()
         assert list((data_dir / name).iterdir()) == []

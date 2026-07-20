@@ -30,9 +30,8 @@ class OrderService:
     ) -> None:
         self.database = database
         self.cooldown_seconds = cooldown_seconds
-        self.purchase_profiles = {
-            profile.profile_id: profile for profile in (purchase_profiles or [])
-        }
+        # 参数仅为兼容旧调用者；锁单链路不再读取本地 PurchaseProfile。
+        _ = purchase_profiles
         self.stage_timeout_seconds = stage_timeout_seconds
         self.max_price_slippage = max_price_slippage
         self._task_locks: dict[str, asyncio.Lock] = {}
@@ -86,29 +85,32 @@ class OrderService:
         self, task: MonitorTask, ticket: TicketInfo, platform: TicketPlatform
     ) -> LockOrderResult:
         async with self._lock_for(task.task_id):
-            profile = self.purchase_profiles.get(task.purchase_profile_id)
-            if profile is None:
+            if not task.platform_audience_ids:
                 return LockOrderResult(
                     LockStatus.MANUAL_PROFILE_MISSING,
-                    "任务未绑定有效购票档案",
+                    "自动锁单任务必须重新选择平台购票人",
                     requires_manual_action=True,
                     failure_kind=FailureKind.RETRYABLE,
                     stage=LockStage.PREFLIGHT,
                 )
-            if (
-                len(profile.audiences) != task.quantity
-                or not profile.has_contact
-                or not profile.has_address
-                or not profile.accept_purchase_notice
-            ):
+            if len(task.platform_audience_ids) != task.quantity:
                 return LockOrderResult(
                     LockStatus.MANUAL_PROFILE_MISSING,
-                    "购票档案人数、联系人、地址或购票须知未完成确定性配置",
+                    "购票人数必须与购买数量一致",
                     requires_manual_action=True,
-                    failure_kind=FailureKind.RETRYABLE,
+                    failure_kind=FailureKind.NON_RETRYABLE,
                     stage=LockStage.PREFLIGHT,
                 )
-            key = self.idempotency_key(task, ticket, profile.account_alias)
+            if len(set(task.platform_audience_ids)) != len(task.platform_audience_ids):
+                return LockOrderResult(
+                    LockStatus.MANUAL_PROFILE_MISSING,
+                    "不能重复选择同一购票人",
+                    requires_manual_action=True,
+                    failure_kind=FailureKind.NON_RETRYABLE,
+                    stage=LockStage.PREFLIGHT,
+                )
+            account_alias = f"{task.platform}:default"
+            key = self.idempotency_key(task, ticket, account_alias)
             loop = asyncio.get_running_loop()
             last_transition_at = loop.time()
 
@@ -138,6 +140,18 @@ class OrderService:
                     LockStatus.NOT_LOGGED_IN,
                     "锁单前登录状态失效",
                     failure_kind=FailureKind.RETRYABLE,
+                    stage=LockStage.PREFLIGHT,
+                )
+
+            audiences_valid, audiences_message = await platform.validate_audience_ids(
+                task.platform_audience_ids
+            )
+            if not audiences_valid:
+                return LockOrderResult(
+                    LockStatus.MANUAL_PROFILE_MISSING,
+                    audiences_message,
+                    requires_manual_action=True,
+                    failure_kind=FailureKind.MANUAL_ACTION,
                     stage=LockStage.PREFLIGHT,
                 )
 
@@ -177,8 +191,9 @@ class OrderService:
                 max_unit_price=task.max_unit_price,
                 max_total_price=allowed_total,
                 idempotency_key=key,
-                account_alias=profile.account_alias,
-                purchase_profile=profile.model_dump(mode="json"),
+                account_alias=account_alias,
+                audience_ids=list(task.platform_audience_ids),
+                audience_labels=list(task.platform_audience_labels),
                 stage_callback=transition,
             )
             claimed = await self.database.claim_lock(

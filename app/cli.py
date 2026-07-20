@@ -330,16 +330,6 @@ def create_task(
     if listing_index < 1 or listing_index > len(listings):
         raise typer.BadParameter("票品序号无效")
     chosen = listings[listing_index - 1]
-    profile_ids = [profile.profile_id for profile in settings.purchase_profiles]
-    if not profile_ids:
-        console.print("[red]私有购票档案为空，未修改配置。[/red]")
-        raise typer.Exit(2)
-    for index, profile_id in enumerate(profile_ids, 1):
-        console.print(f"{index}. {profile_id}")
-    profile_index = typer.prompt("选择购票档案序号", type=int)
-    if profile_index < 1 or profile_index > len(profile_ids):
-        raise typer.BadParameter("购票档案序号无效")
-
     task_id = typer.prompt("任务编号")
     task = MonitorTask.model_validate(
         {
@@ -360,7 +350,8 @@ def create_task(
             "max_unit_price": str(chosen.unit_price),
             "max_total_price": str(chosen.unit_price * quantity),
             "auto_lock": False,
-            "purchase_profile_id": profile_ids[profile_index - 1],
+            "platform_audience_ids": [],
+            "platform_audience_labels": [],
         }
     )
 

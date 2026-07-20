@@ -8,14 +8,16 @@ from decimal import Decimal
 from typing import Any
 
 from app.config import BrowserSettings, MonitorTask, PlatformAutomationSettings
-from app.exceptions import PlatformError
+from app.exceptions import AdapterNotImplementedError, PlatformError
 from app.models import (
+    AudienceCreateRequest,
     FailureKind,
     LockOrderRequest,
     LockOrderResult,
     LockStage,
     LockStatus,
     MatchResult,
+    PlatformAudienceOption,
     TicketInfo,
 )
 from app.platforms.base import TicketPlatform
@@ -111,6 +113,31 @@ class PiaoniuPlatform(TicketPlatform):
     async def search_event(self, task: MonitorTask) -> Any:
         return {"event_id": event_id_from_url(task.event_url), "url": task.event_url}
 
+    async def open_audience_management(self) -> None:
+        """PC 站没有已核验的独立观演人入口，安全打开官方账户设置页。"""
+
+        async with self.normal_operation(), self._page_lock:
+            page = await self.session.page()
+            await page.bring_to_front()
+            await page.goto(
+                "https://www.piaoniu.com/user/profile", wait_until="domcontentloaded"
+            )
+
+    async def list_audiences(self) -> list[PlatformAudienceOption]:
+        await self.open_audience_management()
+        raise AdapterNotImplementedError(
+            "票牛 PC 账户页未提供已核验的稳定购票人 option_id；禁止按姓名猜测"
+        )
+
+    async def create_audience(
+        self, request: AudienceCreateRequest
+    ) -> PlatformAudienceOption:
+        _ = request
+        await self.open_audience_management()
+        raise AdapterNotImplementedError(
+            "票牛独立新增购票人页面尚未核验，请在官方订单页人工新增"
+        )
+
     async def query_tickets(self, task: MonitorTask) -> Sequence[TicketInfo]:
         async with self.normal_operation(), self._page_lock:
             page = await self.session.page()
@@ -191,10 +218,14 @@ class PiaoniuPlatform(TicketPlatform):
                         order_url=safe_page_url(page.url),
                     )
                 await request.transition(LockStage.SELECTING_AUDIENCE, "核对已保存观演人")
-                if re.search(r"(请选择|添加|填写).{0,8}(观演人|实名)", body):
+                audience_selected, audience_message = await self.select_order_audiences(
+                    page, request.audience_ids, request.quantity
+                )
+                if not audience_selected:
+                    await page.bring_to_front()
                     return LockOrderResult(
                         LockStatus.MANUAL_PROFILE_MISSING,
-                        "票牛观演人选择器尚未通过真实页面验证，请人工选择已保存观演人",
+                        audience_message,
                         final_total=final_total,
                         order_url=safe_page_url(page.url),
                         requires_manual_action=True,

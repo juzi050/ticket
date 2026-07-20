@@ -7,6 +7,8 @@ from enum import Enum
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
+
 
 class LoginState(str, Enum):
     LOGGED_IN = "logged_in"
@@ -57,6 +59,42 @@ class FailureKind(str, Enum):
     NON_RETRYABLE = "non_retryable"
     ORDER_EXISTS = "order_exists"
     MANUAL_ACTION = "manual_action"
+
+
+@dataclass(slots=True)
+class PlatformAudienceOption:
+    """平台账号中的远程购票人选项；仅携带稳定引用与平台已脱敏信息。"""
+
+    platform: str
+    option_id: str
+    display_name: str
+    masked_identity: str | None = None
+    enabled: bool = True
+
+
+class AudienceCreateRequest(BaseModel):
+    """只允许存在于当前进程内存中的新增购票人请求。"""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    name: str = Field(min_length=1)
+    certificate_type: str = Field(min_length=1)
+    certificate_number: SecretStr
+    phone: SecretStr | None = None
+
+    def clear_sensitive(self) -> None:
+        """提交结束后主动清除请求对象持有的全部表单值。"""
+
+        self.name = ""
+        self.certificate_type = ""
+        self.certificate_number = SecretStr("")
+        self.phone = None
+
+    def model_dump(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise TypeError("AudienceCreateRequest 是临时敏感对象，禁止序列化")
+
+    def model_dump_json(self, *args: Any, **kwargs: Any) -> str:
+        raise TypeError("AudienceCreateRequest 是临时敏感对象，禁止序列化")
 
 
 @dataclass(slots=True)
@@ -133,6 +171,9 @@ class LockOrderRequest:
     max_total_price: Decimal
     idempotency_key: str
     account_alias: str = ""
+    audience_ids: list[str] = field(default_factory=list)
+    audience_labels: list[str] = field(default_factory=list)
+    # 兼容旧调用者；新任务不再向这里写入本地购票档案。
     purchase_profile: dict[str, Any] = field(default_factory=dict)
     stage_callback: Callable[[LockStage, str], Awaitable[None]] | None = None
 

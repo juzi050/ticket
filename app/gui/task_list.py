@@ -136,11 +136,12 @@ class TaskListFrame(ttk.Frame):
         task = row["task"]
         matched = row.get("is_matched")
         matched_text = "是" if matched == 1 else "否" if matched == 0 else "未知"
+        audiences = "、".join(task.platform_audience_labels) or "未选择"
         self.detail_var.set(
             f"查询次数 {row.get('query_count', 0)}  ·  最近查询 {row.get('last_run_at') or '-'}  ·  "
             f"最近/最低价格 {row.get('last_price') or '-'} / {row.get('min_price') or '-'}  ·  "
             f"可购 {row.get('available_quantity') if row.get('available_quantity') is not None else '-'}  ·  "
             f"当前票档 {row.get('current_ticket_level') or '-'}  ·  当前区域 {row.get('current_area') or '-'}  ·  "
-            f"匹配 {matched_text}\n不匹配原因：{row.get('last_mismatch') or '-'}  ·  "
+            f"匹配 {matched_text}\n指定购票人：{audiences}  ·  不匹配原因：{row.get('last_mismatch') or '-'}  ·  "
             f"最近错误：{row.get('last_error') or '-'}  ·  锁单：{row.get('last_lock_result') or '-'}"
         )

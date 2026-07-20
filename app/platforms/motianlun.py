@@ -2,19 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections import Counter
 from collections.abc import Sequence
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
 from app.config import BrowserSettings, MonitorTask, PlatformAutomationSettings
-from app.exceptions import PlatformError, QuantityUnavailableError
+from app.exceptions import AdapterNotImplementedError, PlatformError, QuantityUnavailableError
 from app.models import (
+    AudienceCreateRequest,
     FailureKind,
     LockOrderRequest,
     LockOrderResult,
     LockStage,
     LockStatus,
     MatchResult,
+    PlatformAudienceOption,
     TicketInfo,
 )
 from app.platforms.base import TicketPlatform
@@ -44,6 +47,7 @@ def require_exact_quantity(values: list[int], requested: int) -> int:
 class MotianlunPlatform(TicketPlatform):
     name = "motianlun"
     display_name = "摩天轮票务"
+    audience_management_url = "https://m.motianlun.cn/package-user/audiences/audiences"
 
     def __init__(
         self, browser: BrowserSettings, automation: PlatformAutomationSettings | None = None
@@ -78,6 +82,152 @@ class MotianlunPlatform(TicketPlatform):
             "event_id": event_id_from_url(task.event_url, "showId"),
             "url": task.event_url,
         }
+
+    async def open_audience_management(self) -> None:
+        async with self.normal_operation(), self._page_lock:
+            page = await self._page()
+            await self._open_audience_management_unlocked(page)
+
+    async def _open_audience_management_unlocked(self, page: Any) -> None:
+        await page.bring_to_front()
+        await page.goto(self.audience_management_url, wait_until="domcontentloaded")
+        await page.get_by_text("我的观演人", exact=True).wait_for(state="visible")
+        await page.wait_for_function(
+            """() => {
+              const text = document.body.innerText || '';
+              return text.includes('暂无观演人') || text.includes('手机号');
+            }""",
+            timeout=15_000,
+        )
+
+    async def list_audiences(self) -> list[PlatformAudienceOption]:
+        async with self.normal_operation(), self._page_lock:
+            page = await self._page()
+            await self._open_audience_management_unlocked(page)
+            return await self._list_audiences_unlocked(page)
+
+    async def _list_audiences_unlocked(self, page: Any) -> list[PlatformAudienceOption]:
+        body = await visible_body_text(page)
+        if "暂无观演人" in body:
+            return []
+        rows = page.locator(".audience_item")
+        options: list[PlatformAudienceOption] = []
+        for index in range(await rows.count()):
+            row = rows.nth(index)
+            name_locator = row.locator(".name").first
+            display_name = (
+                (await name_locator.inner_text()).strip()
+                if await name_locator.count()
+                else ""
+            )
+            text = (await row.inner_text()).strip()
+            masked_lines = [
+                line.strip()
+                for line in text.splitlines()
+                if "*" in line and line.strip()
+            ]
+            masked = " · ".join(masked_lines)
+            option_id = await row.evaluate(
+                """
+                element => {
+                  const nodes = [element, ...element.querySelectorAll('*')];
+                  for (const node of nodes) {
+                    for (const name of ['data-audience-id', 'data-performer-id', 'data-id']) {
+                      const value = node.getAttribute && node.getAttribute(name);
+                      if (value) return value;
+                    }
+                    const href = node.getAttribute && node.getAttribute('href');
+                    const match = href && href.match(/[?&](?:audienceId|audience_id|id)=([^&#]+)/);
+                    if (match) return decodeURIComponent(match[1]);
+                  }
+                  return '';
+                }
+                """
+            )
+            if display_name:
+                options.append(
+                    PlatformAudienceOption(
+                        self.name,
+                        str(option_id or ""),
+                        display_name,
+                        masked or None,
+                        bool(option_id),
+                    )
+                )
+        if not options:
+            raise AdapterNotImplementedError(
+                "摩天轮观演人列表结构已变化，无法安全读取"
+            )
+        return options
+
+    async def create_audience(
+        self, request: AudienceCreateRequest
+    ) -> PlatformAudienceOption:
+        async with self.priority_operation(), self._page_lock:
+            page = await self._page()
+            await self._open_audience_management_unlocked(page)
+            before_options = await self._list_audiences_unlocked(page)
+            before = {option.option_id for option in before_options if option.option_id}
+            certificate = request.certificate_number.get_secret_value()
+            phone = request.phone.get_secret_value() if request.phone else ""
+            inputs: list[Any] = []
+            try:
+                await page.locator("uni-button").filter(
+                    has_text=re.compile(r"^新增观演人$")
+                ).last.click()
+                await page.get_by_text("证件类型", exact=True).wait_for(state="visible")
+                await page.get_by_text("选择证件类型", exact=True).click()
+                await page.get_by_text(request.certificate_type, exact=True).last.click()
+                textboxes = page.get_by_role("textbox")
+                certificate_input = textboxes.nth(0)
+                name_input = textboxes.nth(1)
+                phone_input = page.get_by_role("spinbutton").first
+                inputs = [certificate_input, name_input, phone_input]
+                await certificate_input.fill(certificate)
+                await name_input.fill(request.name)
+                if phone:
+                    await phone_input.fill(phone)
+                # 实页中的“保存”是可点击 uni-view 内的文字节点，事件需要冒泡到父容器。
+                await page.get_by_text("保存", exact=True).last.click()
+                interruption = await detect_interruption(page)
+                if interruption:
+                    await page.bring_to_front()
+                await page.get_by_text("证件号码", exact=True).wait_for(
+                    state="hidden", timeout=60_000
+                )
+            except Exception:
+                for input_box in inputs:
+                    try:
+                        await input_box.fill("")
+                    except Exception:
+                        pass
+                raise
+            after = await self._list_audiences_unlocked(page)
+            added = [
+                option
+                for option in after
+                if option.option_id and option.option_id not in before
+            ]
+            if not added and len(after) == len(before_options) + 1:
+                # 新增成功但页面不暴露稳定 ID：只确认本次多出的展示项，禁止用于自动锁单。
+                previous = Counter(
+                    (option.display_name, option.masked_identity)
+                    for option in before_options
+                )
+                display_added: list[PlatformAudienceOption] = []
+                for option in after:
+                    key = (option.display_name, option.masked_identity)
+                    if previous[key]:
+                        previous[key] -= 1
+                    else:
+                        display_added.append(option)
+                if len(display_added) == 1:
+                    return display_added[0]
+            if len(added) != 1:
+                raise AdapterNotImplementedError(
+                    "平台已保存表单，但无法从页面新增结果中唯一确认稳定 option_id"
+                )
+            return added[0]
 
     async def query_tickets(self, task: MonitorTask) -> Sequence[TicketInfo]:
         async with self.normal_operation(), self._page_lock:
@@ -154,11 +304,14 @@ class MotianlunPlatform(TicketPlatform):
                     return LockOrderResult(status, message, requires_manual_action=True)
 
                 await request.transition(LockStage.SELECTING_AUDIENCE, "核对已保存观演人")
-                body = await visible_body_text(page)
-                if re.search(r"需填\d*位观演人|选择/新增|请选择.{0,6}观演人", body):
+                audience_selected, audience_message = await self.select_order_audiences(
+                    page, request.audience_ids, request.quantity
+                )
+                if not audience_selected:
+                    await page.bring_to_front()
                     return LockOrderResult(
                         LockStatus.MANUAL_PROFILE_MISSING,
-                        "摩天轮观演人选择器尚未通过真实页面验证，请人工选择已保存观演人",
+                        audience_message,
                         order_url=safe_page_url(page.url),
                         requires_manual_action=True,
                         failure_kind=FailureKind.MANUAL_ACTION,
@@ -286,6 +439,10 @@ class MotianlunPlatform(TicketPlatform):
     async def _open_session_selector(self, page: Any) -> None:
         await page.get_by_text("立即购买", exact=True).first.click()
         await page.locator(".session-selecter").first.wait_for(state="visible")
+        # 弹层会先显示骨架，再异步填充场次；只等容器会偶发读到空列表。
+        await page.locator(".session-selecter .session-card .show-name").first.wait_for(
+            state="visible"
+        )
 
     async def _session_choices(self, page: Any, task: MonitorTask) -> list[str]:
         await self._open_session_selector(page)
@@ -315,6 +472,14 @@ class MotianlunPlatform(TicketPlatform):
         if selected is None:
             raise PlatformError("目标场次已不可购买")
         await selected.click()
+        await page.locator("#count-1").wait_for(state="visible")
+        await page.wait_for_function(
+            """selector => {
+              const element = document.querySelector(selector);
+              return element && !element.classList.contains('disabled');
+            }""",
+            arg=f"#count-{quantity}",
+        )
         counts = page.locator('.ticket-number-container [id^="count-"]')
         values: list[int] = []
         for index in range(await counts.count()):
@@ -324,8 +489,26 @@ class MotianlunPlatform(TicketPlatform):
                 values.append(int(match.group(1)))
         actual_count = require_exact_quantity(values, quantity)
         await page.locator(f"#count-{quantity}").click()
-        await page.locator(".session-selecter .button-container .mtl-button").click()
-        await page.wait_for_url(re.compile(r"seat-and-seatplan|account-login"))
+        await page.wait_for_function(
+            "selector => document.querySelector(selector)?.classList.contains('selected')",
+            arg=f"#count-{quantity}",
+        )
+        await page.wait_for_timeout(250)
+        next_button = page.locator(
+            ".session-selecter .button-container .mtl-button"
+        ).first
+        await next_button.click()
+        try:
+            await page.wait_for_url(
+                re.compile(r"seat-and-seatplan|account-login"), timeout=10_000
+            )
+        except Exception:
+            # H5 偶尔会吞掉弹层首次点击；仍停留在同一安全选票弹层时只重试一次。
+            if "show-detail" not in page.url or not await next_button.is_visible():
+                raise
+            await page.wait_for_timeout(500)
+            await next_button.click()
+            await page.wait_for_url(re.compile(r"seat-and-seatplan|account-login"))
         interruption = await detect_interruption(page)
         if interruption:
             raise PlatformError(interruption[1])

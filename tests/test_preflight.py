@@ -39,11 +39,19 @@ def strict_task(sample_task: object):
 
 
 async def run_preflight(task: object, profile: PurchaseProfile, path: Path):
+    seed = task.model_copy(  # type: ignore[attr-defined]
+        update={
+            "platform_audience_ids": [
+                f"mock-audience-{index + 1}" for index in range(task.quantity)  # type: ignore[attr-defined]
+            ]
+        }
+    )
     settings = Settings(
         application=ApplicationSettings(database_path=path),
         purchase_profiles=[profile],
-        tasks=[task],  # type: ignore[list-item]
+        tasks=[seed],
     )
+    settings.tasks = [task]  # type: ignore[list-item]
     database = Database(path)
     await database.initialize()
     notifications = NotificationService(SilentNotifier(), database, settings.notification)
@@ -56,22 +64,23 @@ async def run_preflight(task: object, profile: PurchaseProfile, path: Path):
 async def test_audience_count_mismatch_fails_preflight(
     sample_task: object, purchase_profile: PurchaseProfile, tmp_path: Path
 ) -> None:
-    profile = purchase_profile.model_copy(update={"audiences": purchase_profile.audiences[:1]})
-    result, _, _ = await run_preflight(strict_task(sample_task), profile, tmp_path / "audience.db")
+    task = strict_task(sample_task)
+    task.platform_audience_ids = task.platform_audience_ids[:1]
+    result, _, _ = await run_preflight(task, purchase_profile, tmp_path / "audience.db")
     checks = {check.name: check.passed for check in result.checks}
-    assert not checks["观演人数等于购票数量"]
+    assert not checks["购票人数等于购买数量"]
     assert not result.passed
 
 
-async def test_missing_contact_or_address_fails_preflight(
+async def test_deleted_platform_audience_fails_preflight(
     sample_task: object, purchase_profile: PurchaseProfile, tmp_path: Path
 ) -> None:
-    profile = purchase_profile.model_copy(
-        update={"contact_id": "", "contact_name": "", "address_id": "", "address_label": ""}
+    task = strict_task(sample_task).model_copy(
+        update={"platform_audience_ids": ["mock-audience-1", "deleted-audience"]}
     )
-    result, _, _ = await run_preflight(strict_task(sample_task), profile, tmp_path / "contact.db")
+    result, _, _ = await run_preflight(task, purchase_profile, tmp_path / "deleted.db")
     checks = {check.name: check.passed for check in result.checks}
-    assert not checks["联系人和地址已经存在"]
+    assert not checks["平台购票人引用仍然有效"]
 
 
 async def test_pending_order_blocks_preflight(
@@ -87,7 +96,7 @@ async def test_pending_order_blocks_preflight(
         max_unit_price=task.max_unit_price,
         max_total_price=task.max_total_price,
         idempotency_key="pending-key",
-        account_alias=purchase_profile.account_alias,
+        account_alias="mock:default",
     )
     assert await database.claim_lock(request, 1, 0)
     await database.complete_lock(
@@ -111,12 +120,14 @@ async def test_scheduler_does_not_start_auto_lock_when_preflight_fails(
     sample_task: object, purchase_profile: PurchaseProfile, tmp_path: Path
 ) -> None:
     task = strict_task(sample_task)
-    profile = purchase_profile.model_copy(update={"audiences": purchase_profile.audiences[:1]})
+    task = task.model_copy(
+        update={"platform_audience_ids": ["mock-audience-1", "deleted-audience"]}
+    )
     settings = Settings(
         application=ApplicationSettings(database_path=tmp_path / "blocked.db", mock_mode=True),
         login=LoginSettings(timeout_seconds=1, check_interval_seconds=0.1),
         monitor=MonitorSettings(random_delay_min_seconds=0, random_delay_max_seconds=0),
-        purchase_profiles=[profile],
+        purchase_profiles=[purchase_profile],
         tasks=[task],
     )
     database = Database(settings.application.database_path)

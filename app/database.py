@@ -26,6 +26,22 @@ def _json_default(value: Any) -> str:
     raise TypeError(f"无法序列化 {type(value)!r}")
 
 
+def _migrate_task_config(raw: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """迁移旧本地档案引用；绝不按姓名猜测平台购票人。"""
+
+    audience_selection_required = bool(
+        raw.get("purchase_profile_id") and not raw.get("platform_audience_ids")
+    )
+    interval = raw.get("interval_seconds")
+    if interval is not None and float(interval) < 1:
+        raw["interval_seconds"] = 1
+    if audience_selection_required:
+        raw["auto_lock"] = False
+        raw["enabled"] = False
+        raw["purchase_profile_id"] = ""
+    return raw, audience_selection_required
+
+
 class Database:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -182,7 +198,7 @@ class Database:
                     platform=excluded.platform, event_name=excluded.event_name,
                     sessions_json=excluded.sessions_json, max_unit_price=excluded.max_unit_price,
                     max_total_price=excluded.max_total_price, enabled=excluded.enabled,
-                    task_name=excluded.task_name, config_json=excluded.config_json,
+                    status=excluded.status, task_name=excluded.task_name, config_json=excluded.config_json,
                     updated_at=excluded.updated_at
                 """,
                 (
@@ -240,27 +256,30 @@ class Database:
     async def load_tasks(self) -> list[MonitorTask]:
         async with aiosqlite.connect(self.path) as db:
             cursor = await db.execute(
-                "SELECT task_id, config_json, enabled FROM monitor_tasks "
+                "SELECT task_id, config_json, enabled, status FROM monitor_tasks "
                 "WHERE config_json IS NOT NULL ORDER BY created_at"
             )
             result: list[MonitorTask] = []
             migrated = False
-            for task_id, config_json, enabled in await cursor.fetchall():
-                raw = json.loads(config_json)
-                row_migrated = False
-                # 兼容早期 Mock 加速版本曾写入的亚秒间隔；真实任务仍由模型限制为至少 1 秒。
-                interval = raw.get("interval_seconds")
-                if interval is not None and float(interval) < 1:
-                    raw["interval_seconds"] = 1
-                    migrated = True
-                    row_migrated = True
+            for task_id, config_json, enabled, current_status in await cursor.fetchall():
+                original_raw = json.loads(config_json)
+                raw, audience_selection_required = _migrate_task_config(dict(original_raw))
+                row_migrated = raw != original_raw
                 task = MonitorTask.model_validate(raw)
-                task.enabled = bool(enabled)
+                task.enabled = False if audience_selection_required else bool(enabled)
                 result.append(task)
                 if row_migrated:
+                    migrated = True
                     await db.execute(
-                        "UPDATE monitor_tasks SET config_json=? WHERE task_id=?",
-                        (task.model_dump_json(), task_id),
+                        "UPDATE monitor_tasks SET config_json=?, enabled=?, status=? WHERE task_id=?",
+                        (
+                            task.model_dump_json(),
+                            int(task.enabled),
+                            "audience_selection_required"
+                            if audience_selection_required
+                            else current_status,
+                            task_id,
+                        ),
                     )
             if migrated:
                 await db.commit()
@@ -304,21 +323,26 @@ class Database:
     async def get_task(self, task_id: str) -> MonitorTask | None:
         async with aiosqlite.connect(self.path) as db:
             cursor = await db.execute(
-                "SELECT config_json, enabled FROM monitor_tasks WHERE task_id=?", (task_id,)
+                "SELECT config_json, enabled, status FROM monitor_tasks WHERE task_id=?", (task_id,)
             )
             row = await cursor.fetchone()
             if not row or not row[0]:
                 return None
-            raw = json.loads(row[0])
-            interval = raw.get("interval_seconds")
-            if interval is not None and float(interval) < 1:
-                raw["interval_seconds"] = 1
+            original_raw = json.loads(row[0])
+            raw, audience_selection_required = _migrate_task_config(dict(original_raw))
             task = MonitorTask.model_validate(raw)
-            task.enabled = bool(row[1])
-            if interval is not None and float(interval) < 1:
+            task.enabled = False if audience_selection_required else bool(row[1])
+            if raw != original_raw:
                 await db.execute(
-                    "UPDATE monitor_tasks SET config_json=? WHERE task_id=?",
-                    (task.model_dump_json(), task_id),
+                    "UPDATE monitor_tasks SET config_json=?, enabled=?, status=? WHERE task_id=?",
+                    (
+                        task.model_dump_json(),
+                        int(task.enabled),
+                        "audience_selection_required"
+                        if audience_selection_required
+                        else row[2],
+                        task_id,
+                    ),
                 )
                 await db.commit()
             return task

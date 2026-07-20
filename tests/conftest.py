@@ -42,5 +42,6 @@ def sample_task() -> MonitorTask:
         interval_seconds=1,
         auto_lock=True,
         max_lock_attempts=1,
-        purchase_profile_id="profile-1",
+        platform_audience_ids=["mock-audience-1", "mock-audience-2"],
+        platform_audience_labels=["测试甲", "测试乙"],
     )

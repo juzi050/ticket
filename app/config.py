@@ -169,6 +169,9 @@ class MonitorTask(BaseModel):
     stop_after_lock_success: bool = True
     max_lock_attempts: int = Field(default=1, ge=1)
     max_consecutive_errors: int | None = Field(default=None, ge=1)
+    platform_audience_ids: list[str] = Field(default_factory=list)
+    platform_audience_labels: list[str] = Field(default_factory=list)
+    # 仅用于兼容旧数据库；新建和编辑任务不再使用本地购票档案。
     purchase_profile_id: str = ""
 
     @field_validator("target_sessions", "target_ticket_levels", "target_areas", "target_stands", "target_seat_positions", "excluded_keywords", "area_regexes")
@@ -200,6 +203,12 @@ class MonitorTask(BaseModel):
             and self.random_delay_max_seconds < self.random_delay_min_seconds
         ):
             raise ValueError("任务随机延迟上限不能小于下限")
+        if self.platform_audience_ids and len(self.platform_audience_ids) != self.quantity:
+            raise ValueError("购票人数必须与购买数量一致")
+        if len(set(self.platform_audience_ids)) != len(self.platform_audience_ids):
+            raise ValueError("不能重复选择同一购票人")
+        if self.auto_lock and not self.platform_audience_ids:
+            raise ValueError("自动锁单任务必须选择购票人")
         return self
 
 
@@ -240,6 +249,16 @@ def load_settings(path: str | Path = "config.yaml", *, allow_example: bool = Fal
         raise ConfigurationError(f"配置文件不存在：{config_path}。请先复制 config.example.yaml 为 config.yaml")
     try:
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        for task in raw.get("tasks", []):
+            if (
+                isinstance(task, dict)
+                and task.get("purchase_profile_id")
+                and not task.get("platform_audience_ids")
+            ):
+                # 旧档案不能安全地猜测为平台人员。关闭任务，等待用户重新选择。
+                task["auto_lock"] = False
+                task["enabled"] = False
+                task["purchase_profile_id"] = ""
         profiles_file = Path(raw.get("purchase_profiles_file", "purchase_profiles.yaml"))
         if not profiles_file.is_absolute():
             profiles_file = config_path.parent / profiles_file

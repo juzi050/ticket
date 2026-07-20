@@ -1,4 +1,4 @@
-# 仅展示字段结构。正式档案请复制为 purchase_profiles.yaml 并填写平台已保存选项的引用。
+# 旧版本兼容示例。新建任务不再使用本地购票档案，请在 GUI 的“购票人管理”中操作平台账号。
 # 不要在这里保存完整身份证号、密码、Cookie 或支付信息。
 purchase_profiles:
   - profile_id: example_two_people

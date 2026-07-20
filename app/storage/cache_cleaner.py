@@ -11,10 +11,12 @@ class CacheCleaner:
         self,
         database: Database,
         data_dir: str | Path = "data",
+        log_dir: str | Path = "logs",
         private_files: tuple[str | Path, ...] = (".env", "purchase_profiles.yaml"),
     ) -> None:
         self.database = database
         self.data_dir = Path(data_dir).resolve()
+        self.log_dir = Path(log_dir).resolve()
         self.private_files = tuple(Path(item).resolve() for item in private_files)
 
     def _safe_child(self, target: Path) -> Path:
@@ -33,3 +35,7 @@ class CacheCleaner:
         for private_file in self.private_files:
             if private_file.exists() and private_file.is_file():
                 private_file.unlink()
+        if self.log_dir.exists():
+            for log_file in self.log_dir.glob("*.log*"):
+                if log_file.is_file():
+                    log_file.unlink()

@@ -7,7 +7,7 @@ from tkinter import messagebox, ttk
 from uuid import uuid4
 
 from app.config import MonitorTask
-from app.models import TicketInfo
+from app.models import PlatformAudienceOption, TicketInfo
 
 
 class TaskEditor(tk.Toplevel):
@@ -16,16 +16,21 @@ class TaskEditor(tk.Toplevel):
         parent: tk.Misc,
         *,
         task: MonitorTask | None,
-        profile_ids: list[str],
         discover_callback,
         save_callback,
+        audience_callback=None,
+        profile_ids: list[str] | None = None,
     ) -> None:
         super().__init__(parent)
         self.task = task
-        self.profile_ids = profile_ids
+        # profile_ids 仅保留构造兼容，不再展示或保存本地购票档案。
+        _ = profile_ids
+        self.audience_callback = audience_callback
         self.discover_callback = discover_callback
         self.save_callback = save_callback
         self.tickets: list[TicketInfo] = []
+        self.audiences: list[PlatformAudienceOption] = []
+        self._pending_audience_ids = list(task.platform_audience_ids) if task else []
         self.listing_choices: dict[str, TicketInfo] = {}
         self.discovery_source: tuple[str, str, int] | None = None
         self.title("编辑监控任务" if task else "新建监控任务")
@@ -36,6 +41,7 @@ class TaskEditor(tk.Toplevel):
         self.vars: dict[str, tk.Variable] = {}
         self._build()
         self._load(task)
+        self.after(120, self._refresh_audiences)
 
     def _build(self) -> None:
         shell = ttk.Frame(self, padding=18)
@@ -94,9 +100,37 @@ class TaskEditor(tk.Toplevel):
         row = self._field(form, row, "max_unit_price", "最高单价", pair=True)
         row = self._field(form, row, "max_total_price", "最高总价", pair=True)
         row = self._field(form, row, "interval_seconds", "查询间隔（秒）", pair=True)
-        row = self._field(
-            form, row, "purchase_profile_id", "购票档案", kind="combo", values=self.profile_ids, wide=True
+        ttk.Label(form, text="指定购票人").grid(
+            row=row, column=0, sticky="nw", padx=(0, 8), pady=4
         )
+        audience_box = ttk.Frame(form)
+        audience_box.grid(row=row, column=1, columnspan=3, sticky="ew", padx=(0, 14), pady=4)
+        self.audience_list = tk.Listbox(
+            audience_box,
+            height=6,
+            selectmode=tk.MULTIPLE,
+            exportselection=False,
+            activestyle="none",
+        )
+        audience_scroll = ttk.Scrollbar(
+            audience_box, orient="vertical", command=self.audience_list.yview
+        )
+        self.audience_list.configure(yscrollcommand=audience_scroll.set)
+        self.audience_list.grid(row=0, column=0, sticky="nsew")
+        audience_scroll.grid(row=0, column=1, sticky="ns")
+        audience_box.columnconfigure(0, weight=1)
+        audience_box.rowconfigure(0, weight=1)
+        audience_actions = ttk.Frame(audience_box)
+        audience_actions.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(5, 0))
+        ttk.Button(
+            audience_actions, text="实时刷新购票人", command=self._refresh_audiences
+        ).pack(side="left")
+        self.audience_status = ttk.Label(
+            audience_actions, text="尚未读取平台购票人", style="Muted.TLabel"
+        )
+        self.audience_status.pack(side="left", padx=10)
+        self.audience_list.bind("<<ListboxSelect>>", lambda _event: self._update_audience_status())
+        row += 1
 
         flags = ttk.Frame(form)
         flags.grid(row=row, column=0, columnspan=4, sticky="w", pady=(8, 12))
@@ -126,6 +160,10 @@ class TaskEditor(tk.Toplevel):
         self.vars["area_widget"].bind(  # type: ignore[attr-defined]
             "<<ComboboxSelected>>", lambda _event: self._update_listings()
         )
+        self.vars["platform_widget"].bind(  # type: ignore[attr-defined]
+            "<<ComboboxSelected>>", lambda _event: self._platform_changed()
+        )
+        self.vars["quantity"].trace_add("write", lambda *_args: self._update_audience_status())
 
     def _section(self, parent: ttk.Frame, row: int, text: str) -> int:
         ttk.Label(parent, text=text, style="Section.TLabel").grid(
@@ -183,7 +221,6 @@ class TaskEditor(tk.Toplevel):
             "max_unit_price": task.max_unit_price if task else "",
             "max_total_price": task.max_total_price if task else "",
             "interval_seconds": task.interval_seconds if task and task.interval_seconds else 10,
-            "purchase_profile_id": task.purchase_profile_id if task else "",
         }
         for key, value in values.items():
             self.vars[key].set(str(value))
@@ -192,6 +229,85 @@ class TaskEditor(tk.Toplevel):
         self.vars["notify"].set(task.notify if task else True)
         self.vars["stop_after_lock"].set(task.stop_after_lock_success if task else True)
         self.vars["enabled"].set(task.enabled if task else False)
+        if task:
+            for option_id, label in zip(
+                task.platform_audience_ids,
+                task.platform_audience_labels,
+                strict=False,
+            ):
+                self.audience_list.insert("end", label or option_id)
+                self.audience_list.selection_set("end")
+        self._update_audience_status()
+
+    def _platform_changed(self) -> None:
+        self._pending_audience_ids = []
+        self.audiences = []
+        self.audience_list.delete(0, "end")
+        self._refresh_audiences()
+
+    def _refresh_audiences(self) -> None:
+        if self.audience_callback is None:
+            self.audience_status.configure(text="购票人实时读取不可用")
+            return
+        platform = str(self.vars["platform"].get())
+        preserved = {
+            self.audiences[index].option_id
+            for index in self.audience_list.curselection()
+            if index < len(self.audiences)
+        }
+        if not preserved:
+            preserved = set(self._pending_audience_ids)
+        self._pending_audience_ids = list(preserved)
+        self.audience_status.configure(text="正在实时读取平台账号…")
+        future: Future[list[PlatformAudienceOption]] = self.audience_callback(platform)
+        self._poll_audiences(future)
+
+    def _poll_audiences(self, future: Future[list[PlatformAudienceOption]]) -> None:
+        if not future.done():
+            self.after(100, lambda: self._poll_audiences(future))
+            return
+        try:
+            options = future.result()
+        except Exception as exc:
+            self.audience_status.configure(text="读取失败")
+            messagebox.showerror("刷新购票人失败", str(exc), parent=self)
+            return
+        platform = str(self.vars["platform"].get())
+        self.audiences = [
+            option for option in options if option.platform == platform and option.enabled
+        ]
+        unavailable_count = sum(
+            1 for option in options if option.platform == platform and not option.enabled
+        )
+        selected_ids = set(self._pending_audience_ids)
+        self.audience_list.delete(0, "end")
+        for index, option in enumerate(self.audiences):
+            label = option.display_name
+            if option.masked_identity:
+                label += f" · {option.masked_identity}"
+            self.audience_list.insert("end", label)
+            if option.option_id in selected_ids:
+                self.audience_list.selection_set(index)
+        self._pending_audience_ids = []
+        self._update_audience_status()
+        if unavailable_count and not self.audiences:
+            self.audience_status.configure(
+                text="平台页面未提供稳定购票人 ID，自动锁单需人工接管"
+            )
+
+    def _update_audience_status(self) -> None:
+        if not hasattr(self, "audience_status"):
+            return
+        selected = len(self.audience_list.curselection())
+        try:
+            quantity = int(str(self.vars["quantity"].get()))
+        except (TypeError, ValueError):
+            quantity = 0
+        if selected == quantity and quantity > 0:
+            text = f"已准确选择 {selected} 位购票人"
+        else:
+            text = f"购买数量为 {quantity or '-'}，当前选择 {selected} 位"
+        self.audience_status.configure(text=text)
 
     def _discover(self) -> None:
         try:
@@ -295,6 +411,19 @@ class TaskEditor(tk.Toplevel):
             ):
                 raise ValueError("平台、演出链接或数量已改变，请重新识别票品")
             original = self.task
+            selected_options = [
+                self.audiences[index]
+                for index in self.audience_list.curselection()
+                if index < len(self.audiences)
+            ]
+            audience_ids = [option.option_id for option in selected_options]
+            audience_labels = [option.display_name for option in selected_options]
+            quantity = int(self.vars["quantity"].get())
+            auto_lock = bool(self.vars["auto_lock"].get())
+            if audience_ids and len(audience_ids) != quantity:
+                raise ValueError(f"购买数量为 {quantity}，请准确选择 {quantity} 位购票人。")
+            if auto_lock and not audience_ids:
+                raise ValueError("自动锁单任务必须选择购票人")
             task = MonitorTask(
                 task_id=str(self.vars["task_id"].get()).strip(),
                 task_name=str(self.vars["task_name"].get()).strip(),
@@ -326,15 +455,17 @@ class TaskEditor(tk.Toplevel):
                 row_max=self._optional_int(self.vars["row_max"].get()),
                 seat_min=self._optional_int(self.vars["seat_min"].get()),
                 seat_max=self._optional_int(self.vars["seat_max"].get()),
-                quantity=int(self.vars["quantity"].get()),
+                quantity=quantity,
                 adjacent_seats_required=bool(self.vars["adjacent"].get()),
                 max_unit_price=Decimal(str(self.vars["max_unit_price"].get())),
                 max_total_price=Decimal(str(self.vars["max_total_price"].get())),
                 interval_seconds=float(str(self.vars["interval_seconds"].get())),
-                auto_lock=bool(self.vars["auto_lock"].get()),
+                auto_lock=auto_lock,
                 notify=bool(self.vars["notify"].get()),
                 stop_after_lock_success=bool(self.vars["stop_after_lock"].get()),
-                purchase_profile_id=str(self.vars["purchase_profile_id"].get()),
+                platform_audience_ids=audience_ids,
+                platform_audience_labels=audience_labels,
+                purchase_profile_id="",
             )
             if task.auto_lock and not selected and not task.target_listing_id:
                 raise ValueError("自动锁单任务必须先识别并选择稳定票品")

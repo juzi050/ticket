@@ -10,7 +10,13 @@ from uuid import uuid4
 from app.config import MonitorTask, Settings, load_settings
 from app.database import Database
 from app.gui.ui_events import UiEvent
-from app.models import MatchResult, NotificationMessage, TicketInfo
+from app.models import (
+    AudienceCreateRequest,
+    MatchResult,
+    NotificationMessage,
+    PlatformAudienceOption,
+    TicketInfo,
+)
 from app.notifier import ConsoleNotifier, build_notifier
 from app.scheduler import PlatformRegistry
 from app.services.login_service import LoginService
@@ -37,6 +43,8 @@ class GuiController:
         self.mock_mode = mock_mode
         self.task_store = TaskStore(database)
         self.running: dict[str, asyncio.Task[None]] = {}
+        # 购票人列表只保存在当前进程内存，不写入数据库或配置文件。
+        self.audience_cache: dict[str, list[PlatformAudienceOption]] = {}
         self.platform_status = {"piaoniu": "未检查", "motianlun": "未检查"}
         self.logger = logging.getLogger("app.gui.controller")
         self._build_services()
@@ -172,6 +180,52 @@ class GuiController:
             await page.bring_to_front()
             await page.goto(session.automation.home_url, wait_until="domcontentloaded")
 
+    async def list_audiences(self, platform_name: str) -> list[PlatformAudienceOption]:
+        platform = self.registry.get(platform_name)
+        await platform.initialize()
+        if not await platform.check_login_status():
+            if not await self.login_platform(platform_name):
+                raise ValueError(f"{platform.display_name}尚未登录")
+        options = await platform.list_audiences()
+        self.audience_cache[platform_name] = list(options)
+        self.logger.info(
+            "刷新平台购票人 platform=%s count=%s labels=%s",
+            platform_name,
+            len(options),
+            [option.display_name for option in options],
+        )
+        return list(options)
+
+    async def open_audience_management(self, platform_name: str) -> None:
+        platform = self.registry.get(platform_name)
+        await platform.initialize()
+        if not await platform.check_login_status():
+            if not await self.login_platform(platform_name):
+                raise ValueError(f"{platform.display_name}尚未登录")
+        await platform.open_audience_management()
+
+    async def create_audience(
+        self, platform_name: str, request: AudienceCreateRequest
+    ) -> PlatformAudienceOption:
+        platform = self.registry.get(platform_name)
+        try:
+            await platform.initialize()
+            if not await platform.check_login_status():
+                if not await self.login_platform(platform_name):
+                    raise ValueError(f"{platform.display_name}尚未登录")
+            option = await platform.create_audience(request)
+            self.audience_cache[platform_name] = await platform.list_audiences()
+            self.logger.info(
+                "平台购票人新增成功 platform=%s option_id=%s display_name=%s",
+                platform_name,
+                option.option_id,
+                option.display_name,
+            )
+            return option
+        finally:
+            # 不记录请求内容；成功、失败或取消都清除内存中的敏感值。
+            request.clear_sensitive()
+
     async def list_tasks(self) -> list[dict[str, object]]:
         tasks = {task.task_id: task for task in await self.task_store.list()}
         states = {row["task_id"]: row for row in await self.database.list_task_states()}
@@ -196,6 +250,14 @@ class GuiController:
             raise ValueError(f"任务 ID 已存在：{task.task_id}")
         if original_task_id and original_task_id != task.task_id:
             raise ValueError("编辑任务时不能修改 task_id")
+        if task.platform_audience_ids:
+            platform = self.registry.get(task.platform)
+            await platform.initialize()
+            valid, message = await platform.validate_audience_ids(
+                task.platform_audience_ids
+            )
+            if not valid:
+                raise ValueError(message)
         await self._cancel_running(task.task_id)
         await self.task_store.save(task)
         self.settings.tasks = [item for item in self.settings.tasks if item.task_id != task.task_id]
@@ -222,6 +284,11 @@ class GuiController:
             task.max_unit_price,
             task.max_total_price,
             task.interval_seconds,
+        )
+        self.logger.info(
+            "任务指定购票人 task_id=%s labels=%s",
+            task.task_id,
+            task.platform_audience_labels,
         )
         if task.enabled:
             await self.start_task(task.task_id)
@@ -373,6 +440,11 @@ class GuiController:
         await self.stop_all()
         await self.registry.close()
         await self.notifications.close()
+        # Windows 下先关闭日志文件句柄；FileHandler 下一次写入时会自动重开新文件。
+        for handler in logging.getLogger().handlers:
+            if isinstance(handler, logging.FileHandler):
+                handler.flush()
+                handler.close()
         profile_file = self.settings.purchase_profiles_file
         if ".example." in profile_file.name:
             profile_file = Path("purchase_profiles.yaml").resolve()
@@ -382,6 +454,7 @@ class GuiController:
         ).clear()
         self.settings.tasks = []
         self.settings.purchase_profiles = []
+        self.audience_cache.clear()
         self.settings.notification.enabled = False
         self.settings.notification.provider = "console"
         self.running.clear()

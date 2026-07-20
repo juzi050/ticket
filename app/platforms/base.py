@@ -7,7 +7,15 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from app.config import MonitorTask, PurchaseProfile
-from app.models import LockOrderRequest, LockOrderResult, MatchResult, TicketInfo
+from app.exceptions import AdapterNotImplementedError
+from app.models import (
+    AudienceCreateRequest,
+    LockOrderRequest,
+    LockOrderResult,
+    MatchResult,
+    PlatformAudienceOption,
+    TicketInfo,
+)
 
 
 class TicketPlatform(ABC):
@@ -94,6 +102,49 @@ class TicketPlatform(ABC):
     ) -> tuple[bool | None, str]:
         """验证平台已保存资料；None 表示真实页面选择器尚未确认。"""
         return None, "平台已保存资料的页面选择器尚未验证"
+
+    async def list_audiences(self) -> list[PlatformAudienceOption]:
+        """实时读取当前平台唯一登录账号中的购票人。"""
+
+        raise AdapterNotImplementedError(f"{self.display_name}购票人列表尚未可靠适配")
+
+    async def open_audience_management(self) -> None:
+        """打开平台官方购票人管理页面，供用户人工管理。"""
+
+        raise AdapterNotImplementedError(f"{self.display_name}购票人管理入口尚未可靠适配")
+
+    async def create_audience(
+        self, request: AudienceCreateRequest
+    ) -> PlatformAudienceOption:
+        """通过平台官方页面新增购票人，不持久化请求内容。"""
+
+        raise AdapterNotImplementedError(f"{self.display_name}新增购票人页面尚未可靠适配")
+
+    async def validate_audience_ids(self, audience_ids: list[str]) -> tuple[bool, str]:
+        """重新读取平台账号并验证每个稳定引用仍然存在。"""
+
+        if len(set(audience_ids)) != len(audience_ids):
+            return False, "不能重复选择同一购票人"
+        try:
+            options = await self.list_audiences()
+        except AdapterNotImplementedError as exc:
+            return False, str(exc)
+        available = {
+            option.option_id: option
+            for option in options
+            if option.platform == self.name and option.enabled
+        }
+        missing = [option_id for option_id in audience_ids if option_id not in available]
+        if missing:
+            return False, "任务中的购票人已被删除、停用或不属于当前平台"
+        return True, f"平台账号中存在 {len(audience_ids)} 位指定购票人"
+
+    async def select_order_audiences(
+        self, page: Any, audience_ids: list[str], quantity: int
+    ) -> tuple[bool, str]:
+        """在订单确认页按稳定 ID 精确选人；未适配时禁止猜测。"""
+
+        return False, f"{self.display_name}订单页尚未验证稳定购票人 ID，已暂停人工处理"
 
     async def has_pending_order(
         self, task: MonitorTask, ticket: TicketInfo, account_alias: str

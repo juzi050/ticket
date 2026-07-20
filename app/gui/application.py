@@ -3,12 +3,13 @@ from __future__ import annotations
 import logging
 import queue
 import tkinter as tk
-from concurrent.futures import Future
+from concurrent.futures import Future, TimeoutError
 from pathlib import Path
 from tkinter import messagebox, ttk
 
 from app.config import MonitorTask
 from app.gui.async_runner import AsyncRunner
+from app.gui.audience_panel import AudienceManagerFrame
 from app.gui.controller import GuiController
 from app.gui.log_panel import LogPanel, QueueLogHandler
 from app.gui.platform_panel import PlatformPanel
@@ -26,6 +27,11 @@ CLEAR_CONFIRMATION = """确定要清理全部缓存吗？
 - 所有票务缓存和运行记录
 
 清理后需要重新登录并重新创建任务。
+
+清理缓存只会删除本软件的本地登录状态、任务和缓存。
+
+不会删除已经保存到票牛或摩天轮账号中的购票人。
+如需删除平台购票人，请前往对应平台账号管理页面操作。
 
 此操作不可恢复。"""
 
@@ -151,7 +157,18 @@ class TicketMonitorApplication:
             lambda: self._submit(self.controller.open_platform_home("motianlun")),
         )
         self.log_panel = LogPanel(self.notebook)
+        self.audience_panel = AudienceManagerFrame(
+            self.notebook,
+            lambda platform: self.runner.submit(self.controller.list_audiences(platform)),
+            lambda platform, request: self.runner.submit(
+                self.controller.create_audience(platform, request)
+            ),
+            lambda platform: self._submit(
+                self.controller.open_audience_management(platform)
+            ),
+        )
         self.notebook.add(self.task_list, text="任务管理")
+        self.notebook.add(self.audience_panel, text="购票人管理")
         self.notebook.add(self.piaoniu_panel, text="票牛")
         self.notebook.add(self.motianlun_panel, text="摩天轮")
         self.notebook.add(self.log_panel, text="运行日志")
@@ -255,7 +272,9 @@ class TicketMonitorApplication:
         TaskEditor(
             self.root,
             task=task,
-            profile_ids=[profile.profile_id for profile in self.controller.settings.purchase_profiles],
+            audience_callback=lambda platform: self.runner.submit(
+                self.controller.list_audiences(platform)
+            ),
             discover_callback=lambda platform, url, quantity: self.runner.submit(
                 self.controller.discover(platform, url, quantity)
             ),
@@ -323,7 +342,13 @@ class TicketMonitorApplication:
             logging.getLogger().removeHandler(self._log_handler)
         if self.runner and self.controller:
             if self._startup_future and not self._startup_future.done():
-                self._startup_future.cancel()
+                try:
+                    # 启动中的短数据库操作先自然收尾，避免关闭事件循环时遗留工作线程。
+                    self._startup_future.result(timeout=2)
+                except TimeoutError:
+                    self._startup_future.cancel()
+                except Exception:
+                    pass
             future = self.runner.submit(self.controller.shutdown())
             try:
                 future.result(timeout=15)
@@ -343,6 +368,7 @@ class TicketMonitorApplication:
                     self.motianlun_panel,
                     ("status_var", "running_var", "paused_var", "error_var"),
                 ),
+                (self.audience_panel, ("platform_var", "status_var")),
             ):
                 for name in names:
                     if hasattr(owner, name):

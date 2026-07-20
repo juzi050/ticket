@@ -3,10 +3,44 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+import re
 from typing import Any
 
 from app.config import BrowserSettings, PlatformAutomationSettings
 from app.exceptions import PlatformError
+
+
+_RAW_PERSONAL_DATA_PATTERNS = (
+    re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)"),
+    re.compile(r"(?<!\d)\d{17}[0-9Xx](?!\d)"),
+)
+
+
+def _contains_raw_personal_data(value: object) -> bool:
+    text = str(value or "")
+    return any(pattern.search(text) for pattern in _RAW_PERSONAL_DATA_PATTERNS)
+
+
+def sanitize_storage_state(state: dict[str, Any]) -> dict[str, Any]:
+    """移除含完整手机号或身份证号的 Cookie/LocalStorage 项。"""
+
+    sanitized = dict(state)
+    sanitized["cookies"] = [
+        dict(cookie)
+        for cookie in state.get("cookies", [])
+        if not _contains_raw_personal_data(cookie.get("value"))
+    ]
+    origins: list[dict[str, Any]] = []
+    for origin_state in state.get("origins", []):
+        clean_origin = dict(origin_state)
+        clean_origin["localStorage"] = [
+            dict(item)
+            for item in origin_state.get("localStorage", [])
+            if not _contains_raw_personal_data(item.get("value"))
+        ]
+        origins.append(clean_origin)
+    sanitized["origins"] = origins
+    return sanitized
 
 
 class BrowserSessionService:
@@ -99,7 +133,12 @@ class BrowserSessionService:
 
     async def save_state(self) -> None:
         if self._context is not None:
-            await self._context.storage_state(path=str(self.state_file.resolve()))
+            state = await self._context.storage_state()
+            sanitized = sanitize_storage_state(state)
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
+            self.state_file.write_text(
+                json.dumps(sanitized, ensure_ascii=False), encoding="utf-8"
+            )
 
     async def _restore_state(self) -> None:
         """将 Storage State 恢复到持久化上下文，兼容仅靠资料目录无法恢复的站点。"""
@@ -107,6 +146,12 @@ class BrowserSessionService:
             return
         try:
             state = json.loads(self.state_file.read_text(encoding="utf-8"))
+            sanitized = sanitize_storage_state(state)
+            if sanitized != state:
+                self.state_file.write_text(
+                    json.dumps(sanitized, ensure_ascii=False), encoding="utf-8"
+                )
+                state = sanitized
             cookies = state.get("cookies", [])
             if cookies:
                 await self._context.add_cookies(cookies)

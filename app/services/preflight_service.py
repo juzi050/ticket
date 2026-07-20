@@ -154,35 +154,37 @@ class PreflightService:
             f"查询间隔={interval}秒",
         )
 
-        profile = self.settings.get_purchase_profile(task.purchase_profile_id)
-        add("购票档案存在", profile is not None, task.purchase_profile_id or "任务未配置档案")
-        audience_ok = bool(profile and len(profile.audiences) == task.quantity)
+        audience_ids = list(task.platform_audience_ids)
         add(
-            "观演人数等于购票数量",
+            "自动锁单已选择购票人",
+            bool(audience_ids),
+            f"购票人数={len(audience_ids)}" if audience_ids else "需要重新选择购票人",
+        )
+        audience_ok = len(audience_ids) == task.quantity
+        add(
+            "购票人数等于购买数量",
             audience_ok,
-            f"观演人={len(profile.audiences) if profile else 0}，购票={task.quantity}",
+            f"购票人数={len(audience_ids)}，任务要求数量={task.quantity}",
         )
-        contact_address_ok = bool(profile and profile.has_contact and profile.has_address)
-        remote_profile_ok: bool | None = None
-        remote_profile_message = "购票档案不存在"
-        if profile:
-            remote_profile_ok, remote_profile_message = await platform.validate_purchase_profile(
-                profile, task.quantity
-            )
+        unique_audiences = len(set(audience_ids)) == len(audience_ids)
         add(
-            "联系人和地址已经存在",
-            contact_address_ok and remote_profile_ok is True,
-            (
-                remote_profile_message
-                if contact_address_ok
-                else "联系人或地址引用缺失"
-            ),
+            "购票人未重复",
+            unique_audiences,
+            "无重复引用" if unique_audiences else "不能重复选择同一购票人",
         )
-        notice_ok = bool(profile and profile.accept_purchase_notice)
+        remote_audience_ok = False
+        remote_audience_message = "任务未选择购票人"
+        if audience_ids and audience_ok and unique_audiences:
+            try:
+                remote_audience_ok, remote_audience_message = (
+                    await platform.validate_audience_ids(audience_ids)
+                )
+            except Exception as exc:
+                remote_audience_message = f"实时读取平台购票人失败：{exc}"
         add(
-            "已接受购票须知",
-            notice_ok,
-            "已确认" if notice_ok else "购票档案未确认接受购票须知",
+            "平台购票人引用仍然有效",
+            remote_audience_ok,
+            remote_audience_message,
         )
 
         notification_configured = self.settings.notification.enabled and (
@@ -209,9 +211,10 @@ class PreflightService:
         candidate = exact_quantity[0] if exact_quantity else None
         local_pending = False
         platform_pending: bool | None = None
-        if profile and candidate:
+        account_alias = f"{task.platform}:default"
+        if candidate:
             local_pending = await self.database.has_pending_order(
-                account_alias=profile.account_alias,
+                account_alias=account_alias,
                 platform=candidate.platform,
                 event_id=candidate.event_id,
                 session_id=candidate.session_id,
@@ -219,7 +222,7 @@ class PreflightService:
                 quantity=task.quantity,
             )
             platform_pending = await platform.has_pending_order(
-                task, candidate, profile.account_alias
+                task, candidate, account_alias
             )
         no_pending = not local_pending and platform_pending is False
         pending_message = (

@@ -41,8 +41,7 @@ strict_lock:
   stop_before_payment: true
   stage_timeout_seconds: 30
 
-# 正式使用时改为 purchase_profiles.yaml；该私有文件已加入 .gitignore。
-purchase_profiles_file: purchase_profiles.example.yaml
+# 旧 purchase_profiles_file 仅为数据库迁移兼容保留；新任务从平台实时读取购票人。
 
 # 只有确认了真实页面标记后才填写。选择器采用 Playwright locator 语法。
 platforms:
@@ -65,7 +64,7 @@ platforms:
 tasks:
   - task_id: piaoniu_001
     task_name: 票牛示例双人任务
-    enabled: true
+    enabled: false
     platform: piaoniu
     event_name: 示例演唱会
     event_url: https://www.piaoniu.com/example
@@ -104,11 +103,16 @@ tasks:
     notify: true
     stop_after_lock_success: true
     max_lock_attempts: 1
-    purchase_profile_id: example_two_people
+    platform_audience_ids:
+      - mock-audience-1
+      - mock-audience-2
+    platform_audience_labels:
+      - 示例观演人甲
+      - 示例观演人乙
 
   - task_id: piaoniu_002
     task_name: 票牛示例单人通知
-    enabled: true
+    enabled: false
     platform: piaoniu
     event_name: 示例演唱会第二场
     event_url: https://www.piaoniu.com/example2
@@ -129,11 +133,12 @@ tasks:
     interval_seconds: 15
     auto_lock: false
     notify: true
-    purchase_profile_id: example_one_person
+    platform_audience_ids: []
+    platform_audience_labels: []
 
   - task_id: motianlun_001
     task_name: 摩天轮示例双人任务
-    enabled: true
+    enabled: false
     platform: motianlun
     event_name: 示例音乐节
     event_url: https://m.motianlun.cn/example
@@ -156,4 +161,9 @@ tasks:
     notify: true
     stop_after_lock_success: true
     max_lock_attempts: 1
-    purchase_profile_id: example_two_people
+    platform_audience_ids:
+      - mock-audience-1
+      - mock-audience-2
+    platform_audience_labels:
+      - 示例观演人甲
+      - 示例观演人乙
