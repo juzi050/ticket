@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from contextlib import asynccontextmanager
 from typing import Any
 
 from app.config import MonitorTask, PurchaseProfile
@@ -11,6 +13,57 @@ from app.models import LockOrderRequest, LockOrderResult, MatchResult, TicketInf
 class TicketPlatform(ABC):
     name: str
     display_name: str
+
+    def _ensure_operation_gate(self) -> None:
+        if not hasattr(self, "_operation_condition"):
+            self._operation_condition = asyncio.Condition()
+            self._active_normal_operations = 0
+            self._priority_waiters = 0
+            self._priority_owner = None
+
+    @asynccontextmanager
+    async def normal_operation(self):
+        """普通查询共享入口；锁单等待者存在时不再放入新查询。"""
+        self._ensure_operation_gate()
+        current = asyncio.current_task()
+        if self._priority_owner is current:
+            yield
+            return
+        async with self._operation_condition:
+            await self._operation_condition.wait_for(
+                lambda: self._priority_owner is None and self._priority_waiters == 0
+            )
+            self._active_normal_operations += 1
+        try:
+            yield
+        finally:
+            async with self._operation_condition:
+                self._active_normal_operations -= 1
+                self._operation_condition.notify_all()
+
+    @asynccontextmanager
+    async def priority_operation(self):
+        """锁单独占入口；等待现有查询结束并阻止后续查询穿插。"""
+        self._ensure_operation_gate()
+        current = asyncio.current_task()
+        if self._priority_owner is current:
+            yield
+            return
+        async with self._operation_condition:
+            self._priority_waiters += 1
+            try:
+                await self._operation_condition.wait_for(
+                    lambda: self._priority_owner is None and self._active_normal_operations == 0
+                )
+                self._priority_owner = current
+            finally:
+                self._priority_waiters -= 1
+        try:
+            yield
+        finally:
+            async with self._operation_condition:
+                self._priority_owner = None
+                self._operation_condition.notify_all()
 
     @abstractmethod
     async def initialize(self) -> None:

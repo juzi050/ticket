@@ -4,6 +4,7 @@ from urllib.parse import urlsplit
 
 from app.config import MonitorTask, Settings
 from app.database import Database
+from app.logger import task_logger
 from app.models import NotificationMessage, PreflightCheck, PreflightResult, TicketInfo
 from app.platforms.base import TicketPlatform
 from app.services.notification_service import NotificationService
@@ -19,6 +20,7 @@ class PreflightService:
 
     async def run(self, task: MonitorTask, platform: TicketPlatform) -> PreflightResult:
         checks: list[PreflightCheck] = []
+        logger = task_logger("app.preflight", task.task_id, task.platform)
 
         def add(name: str, passed: bool, message: str) -> None:
             checks.append(PreflightCheck(name, passed, message))
@@ -44,6 +46,19 @@ class PreflightService:
             "演出链接有效",
             link_ok,
             task.event_url if link_ok else query_error or "页面未返回有效演出 ID",
+        )
+
+        event_names = {ticket.event_name for ticket in tickets if ticket.event_name}
+        configured_event = "".join(task.event_name.split()).casefold()
+        event_name_ok = any(
+            configured_event in "".join(name.split()).casefold()
+            or "".join(name.split()).casefold() in configured_event
+            for name in event_names
+        )
+        add(
+            "演出名称正确",
+            event_name_ok,
+            f"配置={task.event_name}，页面={', '.join(sorted(event_names)) or '未知'}",
         )
 
         event_id_ok = bool(task.event_id and discovered_event_id == task.event_id)
@@ -80,8 +95,23 @@ class PreflightService:
             or any(value in ticket.ticket_level for value in task.target_ticket_levels)
         ]
         add("目标票档存在", bool(level_tickets), "已定位" if level_tickets else "未找到目标票档")
+        area_tickets = [
+            ticket
+            for ticket in level_tickets
+            if not task.target_areas
+            or any(
+                area.replace(" ", "").casefold()
+                in (ticket.area or "").replace(" ", "").casefold()
+                for area in task.target_areas
+            )
+        ]
+        add(
+            "目标区域存在",
+            bool(area_tickets),
+            "已定位" if area_tickets else "未找到目标区域",
+        )
         stable = [
-            ticket for ticket in level_tickets
+            ticket for ticket in area_tickets
             if ticket.listing_id
             and (not task.target_listing_id or ticket.listing_id == task.target_listing_id)
             and (
@@ -110,6 +140,18 @@ class PreflightService:
             "目标数量能够精确选择",
             bool(exact_quantity),
             f"要求 {task.quantity} 张" if exact_quantity else f"没有精确的 {task.quantity} 张选项",
+        )
+        add("购买数量有效", task.quantity > 0, f"购买数量={task.quantity}")
+        add(
+            "价格上限有效",
+            task.max_unit_price > 0 and task.max_total_price > 0,
+            f"最高单价={task.max_unit_price}，最高总价={task.max_total_price}",
+        )
+        interval = task.interval_seconds or self.settings.monitor.default_interval_seconds
+        add(
+            "查询间隔合理",
+            interval >= 1,
+            f"查询间隔={interval}秒",
         )
 
         profile = self.settings.get_purchase_profile(task.purchase_profile_id)
@@ -195,4 +237,11 @@ class PreflightService:
         except Exception:
             database_ok = False
         add("浏览器和数据库状态正常", logged_in and database_ok, "正常" if logged_in and database_ok else "异常")
+        for check in checks:
+            logger.info(
+                "预检 [%s] %s：%s",
+                "通过" if check.passed else "失败",
+                check.name,
+                check.message,
+            )
         return PreflightResult(task.task_id, checks, candidate)

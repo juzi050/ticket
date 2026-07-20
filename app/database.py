@@ -110,7 +110,43 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS idx_lock_stage_key
                     ON lock_stage_records(idempotency_key, created_at);
+                CREATE TABLE IF NOT EXISTS ticket_cache (
+                    task_id TEXT NOT NULL,
+                    platform TEXT NOT NULL,
+                    listing_id TEXT NOT NULL,
+                    ticket_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(task_id, listing_id)
+                );
+                CREATE TABLE IF NOT EXISTS app_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS platform_sessions (
+                    platform TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    checked_at TEXT NOT NULL
+                );
                 """
+            )
+            await self._ensure_columns(
+                db,
+                "monitor_tasks",
+                {
+                    "task_name": "TEXT NOT NULL DEFAULT ''",
+                    "config_json": "TEXT",
+                    "query_count": "INTEGER NOT NULL DEFAULT 0",
+                    "last_price": "TEXT",
+                    "min_price": "TEXT",
+                    "available_quantity": "INTEGER",
+                    "current_ticket_level": "TEXT",
+                    "current_area": "TEXT",
+                    "is_matched": "INTEGER",
+                    "last_mismatch": "TEXT",
+                    "last_error": "TEXT",
+                    "last_lock_result": "TEXT",
+                },
             )
             await self._ensure_columns(
                 db,
@@ -140,17 +176,19 @@ class Database:
                 """
                 INSERT INTO monitor_tasks(
                     task_id, platform, event_name, sessions_json, max_unit_price, max_total_price,
-                    enabled, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    enabled, status, task_name, config_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(task_id) DO UPDATE SET
                     platform=excluded.platform, event_name=excluded.event_name,
                     sessions_json=excluded.sessions_json, max_unit_price=excluded.max_unit_price,
                     max_total_price=excluded.max_total_price, enabled=excluded.enabled,
+                    task_name=excluded.task_name, config_json=excluded.config_json,
                     updated_at=excluded.updated_at
                 """,
                 (
                     task.task_id, task.platform, task.event_name, json.dumps(task.target_sessions, ensure_ascii=False),
-                    str(task.max_unit_price), str(task.max_total_price), int(task.enabled), status, now, now,
+                    str(task.max_unit_price), str(task.max_total_price), int(task.enabled), status,
+                    task.task_name, task.model_dump_json(), now, now,
                 ),
             )
             await db.commit()
@@ -199,6 +237,203 @@ class Database:
             cursor = await db.execute("SELECT * FROM monitor_tasks ORDER BY task_id")
             return [dict(row) for row in await cursor.fetchall()]
 
+    async def load_tasks(self) -> list[MonitorTask]:
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                "SELECT task_id, config_json, enabled FROM monitor_tasks "
+                "WHERE config_json IS NOT NULL ORDER BY created_at"
+            )
+            result: list[MonitorTask] = []
+            migrated = False
+            for task_id, config_json, enabled in await cursor.fetchall():
+                raw = json.loads(config_json)
+                row_migrated = False
+                # 兼容早期 Mock 加速版本曾写入的亚秒间隔；真实任务仍由模型限制为至少 1 秒。
+                interval = raw.get("interval_seconds")
+                if interval is not None and float(interval) < 1:
+                    raw["interval_seconds"] = 1
+                    migrated = True
+                    row_migrated = True
+                task = MonitorTask.model_validate(raw)
+                task.enabled = bool(enabled)
+                result.append(task)
+                if row_migrated:
+                    await db.execute(
+                        "UPDATE monitor_tasks SET config_json=? WHERE task_id=?",
+                        (task.model_dump_json(), task_id),
+                    )
+            if migrated:
+                await db.commit()
+            return result
+
+    async def get_metadata(self, key: str) -> str | None:
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute("SELECT value FROM app_metadata WHERE key=?", (key,))
+            row = await cursor.fetchone()
+            return str(row[0]) if row else None
+
+    async def set_metadata(self, key: str, value: str) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """
+                INSERT INTO app_metadata(key, value, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+                """,
+                (key, value, utc_now().isoformat()),
+            )
+            await db.commit()
+
+    async def save_platform_session(self, platform: str, status: str) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """
+                INSERT INTO platform_sessions(platform, status, checked_at) VALUES (?, ?, ?)
+                ON CONFLICT(platform) DO UPDATE SET
+                    status=excluded.status, checked_at=excluded.checked_at
+                """,
+                (platform, status, utc_now().isoformat()),
+            )
+            await db.commit()
+
+    async def list_platform_sessions(self) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM platform_sessions ORDER BY platform")
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def get_task(self, task_id: str) -> MonitorTask | None:
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                "SELECT config_json, enabled FROM monitor_tasks WHERE task_id=?", (task_id,)
+            )
+            row = await cursor.fetchone()
+            if not row or not row[0]:
+                return None
+            raw = json.loads(row[0])
+            interval = raw.get("interval_seconds")
+            if interval is not None and float(interval) < 1:
+                raw["interval_seconds"] = 1
+            task = MonitorTask.model_validate(raw)
+            task.enabled = bool(row[1])
+            if interval is not None and float(interval) < 1:
+                await db.execute(
+                    "UPDATE monitor_tasks SET config_json=? WHERE task_id=?",
+                    (task.model_dump_json(), task_id),
+                )
+                await db.commit()
+            return task
+
+    async def delete_task(self, task_id: str) -> bool:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            for table in ("price_history", "match_records", "lock_records", "lock_stage_records", "ticket_cache"):
+                await db.execute(f"DELETE FROM {table} WHERE task_id=?", (task_id,))
+            cursor = await db.execute("DELETE FROM monitor_tasks WHERE task_id=?", (task_id,))
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def update_task_snapshot(
+        self,
+        task_id: str,
+        *,
+        status: str | None = None,
+        query_increment: bool = False,
+        last_price: Decimal | None = None,
+        available_quantity: int | None = None,
+        ticket_level: str | None = None,
+        area: str | None = None,
+        matched: bool | None = None,
+        mismatch_reason: str | None = None,
+        error: str | None = None,
+        lock_result: str | None = None,
+    ) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """
+                UPDATE monitor_tasks SET
+                    status=COALESCE(?, status),
+                    query_count=query_count + ?,
+                    last_price=COALESCE(?, last_price),
+                    min_price=CASE
+                        WHEN ? IS NULL THEN min_price
+                        WHEN min_price IS NULL OR CAST(? AS REAL) < CAST(min_price AS REAL) THEN ?
+                        ELSE min_price END,
+                    available_quantity=COALESCE(?, available_quantity),
+                    current_ticket_level=COALESCE(?, current_ticket_level),
+                    current_area=COALESCE(?, current_area),
+                    is_matched=COALESCE(?, is_matched),
+                    last_mismatch=?, last_error=?, last_lock_result=COALESCE(?, last_lock_result),
+                    updated_at=?, last_run_at=CASE WHEN ? THEN ? ELSE last_run_at END
+                WHERE task_id=?
+                """,
+                (
+                    status,
+                    int(query_increment),
+                    str(last_price) if last_price is not None else None,
+                    str(last_price) if last_price is not None else None,
+                    str(last_price) if last_price is not None else None,
+                    str(last_price) if last_price is not None else None,
+                    available_quantity,
+                    ticket_level,
+                    area,
+                    int(matched) if matched is not None else None,
+                    mismatch_reason,
+                    error,
+                    lock_result,
+                    utc_now().isoformat(),
+                    int(query_increment),
+                    utc_now().isoformat(),
+                    task_id,
+                ),
+            )
+            await db.commit()
+
+    async def save_ticket_cache(self, task_id: str, ticket: TicketInfo) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                """
+                INSERT INTO ticket_cache(task_id, platform, listing_id, ticket_json, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(task_id, listing_id) DO UPDATE SET
+                    ticket_json=excluded.ticket_json, updated_at=excluded.updated_at
+                """,
+                (
+                    task_id,
+                    ticket.platform,
+                    ticket.listing_id or "unknown",
+                    json.dumps(asdict(ticket), ensure_ascii=False, default=_json_default),
+                    utc_now().isoformat(),
+                ),
+            )
+            await db.commit()
+
+    async def list_ticket_cache(self, task_id: str | None = None) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            if task_id:
+                cursor = await db.execute(
+                    "SELECT * FROM ticket_cache WHERE task_id=? ORDER BY updated_at DESC", (task_id,)
+                )
+            else:
+                cursor = await db.execute("SELECT * FROM ticket_cache ORDER BY updated_at DESC")
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def clear_all_data(self) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            for table in (
+                "notification_records",
+                "lock_stage_records",
+                "lock_records",
+                "match_records",
+                "price_history",
+                "ticket_cache",
+                "monitor_tasks",
+                "platform_sessions",
+            ):
+                await db.execute(f"DELETE FROM {table}")
+            await db.commit()
+
     async def record_price(self, task_id: str, ticket: TicketInfo) -> None:
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
@@ -215,6 +450,7 @@ class Database:
                 ),
             )
             await db.commit()
+        await self.save_ticket_cache(task_id, ticket)
 
     async def record_match(self, task: MonitorTask, result: MatchResult, lock_triggered: bool) -> None:
         if result.ticket is None:

@@ -1,6 +1,6 @@
 # Python 票务价格监控与锁单辅助系统
 
-这是一个面向 Python 3.11+、Windows 10/11 的异步票务监控与严格锁单项目。它会提前完成确定性配置和预检，发现完全一致的票品后进入官方订单流程，并且最多停在待支付状态。
+这是一个面向 Python 3.11+、Windows 10/11 的单用户本地桌面票务监控软件。它使用 Tkinter 管理票牛和摩天轮的多个任务，提前完成确定性配置和预检，发现完全一致的票品后进入官方订单流程，并且最多停在待支付状态。
 
 > 重要：程序只辅助进入正常订单确认/锁库存流程，永远不会自动付款。验证码、短信、扫码、实名确认、风控和支付必须由用户人工完成。
 
@@ -10,10 +10,13 @@
 
 - 配置校验、金额 `Decimal` 处理、价格/区域/排数/座位/连座匹配；
 - `asyncio` 多任务调度、任务异常隔离、动态启停、随机抖动和降频；
+- Tkinter 任务管理、平台状态、实时运行指标和日志界面，后台 asyncio 线程不会阻塞窗口；
+- 每个平台固定一个适配器、一个持久化浏览器上下文和一个登录流程；同平台可运行多个任务；
+- 平台级优先操作门闩：普通查询互斥，锁单等待时不再放入新查询；
 - 每个平台独立的持久化浏览器目录、Storage State 和异步登录锁；
-- SQLite 任务、价格、匹配、锁单、通知记录；
+- SQLite 任务唯一配置源、运行快照、票务缓存、价格、匹配、锁单和通知记录；
 - 锁单前按场次 ID、稳定票品 ID 和精确数量重新查询，原票品消失时禁止相似替换；
-- 本地私有购票档案、14 项启动前预检、阶段状态记录和按失败类型冷却重试；
+- 本地私有购票档案、完整启动前预检、阶段状态记录和按失败类型冷却重试；
 - 企业微信机器人、Server酱、PushPlus 和控制台通知；
 - 通知指数退避、后台发送、日志按天轮转和敏感字段脱敏；
 - 不依赖真实网站的 Mock 登录、监控、匹配、锁单、通知完整流程；
@@ -41,6 +44,11 @@
 │   ├── config.py / models.py / database.py
 │   ├── logger.py / retry.py / notifier.py
 │   ├── scheduler.py / cli.py
+│   ├── gui/
+│   │   ├── application.py / controller.py / async_runner.py
+│   │   ├── task_list.py / task_editor.py / platform_panel.py / log_panel.py
+│   ├── storage/
+│   │   ├── task_store.py / ticket_cache.py / cache_cleaner.py
 │   ├── platforms/
 │   │   ├── base.py / piaoniu.py / motianlun.py / mock.py
 │   └── services/
@@ -50,6 +58,7 @@
 ├── data/
 │   ├── browser_states/
 │   ├── browser_profiles/
+│   ├── cache/
 │   └── ticket_monitor.db
 ├── logs/
 └── tests/
@@ -67,6 +76,7 @@ python -m playwright install chromium
 Copy-Item .env.example .env
 Copy-Item config.example.yaml config.yaml
 python main.py validate-config
+python main.py gui
 ```
 
 如果 PowerShell 禁止激活脚本，可以仅在当前用户范围执行：
@@ -79,7 +89,9 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 
 ## 配置
 
-业务任务放在 `config.yaml`，敏感 Token/Webhook 放在 `.env`，购票档案放在 `purchase_profiles.yaml`。这三个实际文件都已被 `.gitignore` 排除。
+全局浏览器、通知和平台页面规则放在 `config.yaml`，敏感 Token/Webhook 放在 `.env`，购票档案放在 `purchase_profiles.yaml`。实际任务以 SQLite `monitor_tasks.config_json` 为唯一权威来源，GUI、`create-task`、启用、暂停和删除操作都直接更新 SQLite。
+
+为了兼容旧配置，数据库第一次初始化时会将 YAML 中的任务迁移一次，并写入 `tasks_initialized` 标记。以后即使 SQLite 任务为空也不会反复从 YAML 导入，因此执行“清理缓存”后任务不会自动复活。
 
 购票档案只保存平台账号中已有选项的引用，例如观演人名称或平台选项 ID、手机号后四位、联系人/地址标识和配送方式。不要填写完整身份证号、密码、Cookie 或支付信息。先在平台账号里保存观演人、联系人和地址，再复制示例：
 
@@ -93,7 +105,7 @@ Copy-Item purchase_profiles.example.yaml purchase_profiles.yaml
 purchase_profiles_file: purchase_profiles.yaml
 ```
 
-每个任务支持：平台、演出名称和 ID、场次、日期时间、多票档、多区域、多看台、位置候选、排除词、区域正则、排号/座位号范围、区域优先级、数量、连座、单价/总价上限、独立查询间隔、随机抖动、自动锁单、通知、成功后停止和异常阈值。`attempt_count` 仅用于审计，不再因为达到次数上限永久封禁临时错误。
+每个任务支持：任务名称、平台、演出名称和 ID、场次、日期时间、多票档、多区域、多看台、位置候选、排除词、区域正则、排号/座位号范围、区域优先级、数量、连座、单价/总价上限、独立查询间隔、随机抖动、自动锁单、通知、成功后停止和异常阈值。`attempt_count` 仅用于审计，不再因为达到次数上限永久封禁临时错误。
 
 严格自动锁单任务还应由 `discover`/`create-task` 写入 `target_session_id`、`target_listing_id`、票牛的 `target_ticket_group_id` 和 `purchase_profile_id`，不要手工猜 ID。
 
@@ -160,6 +172,12 @@ PUSHPLUS_TOKEN=
 ## 命令
 
 ```powershell
+# 桌面软件
+python main.py gui
+
+# 使用独立 Mock 数据库运行多任务桌面演示
+python main.py gui --mock
+
 # 校验配置
 python main.py validate-config
 
@@ -197,6 +215,31 @@ python main.py mock
 
 按 `Ctrl+C` 退出。调度器会取消监控任务并关闭浏览器和通知客户端。
 
+## 桌面界面
+
+主界面采用“本地值守台”布局：顶部持续显示票牛、摩天轮登录状态和运行任务数量；标签页包含任务管理、票牛、摩天轮和运行日志。
+
+任务管理页支持：
+
+- 新建、编辑、复制和删除任务；
+- 启用、暂停、停止和立即查询；
+- 输入官方演出链接后只读识别演出、场次、票档、区域和稳定票品 ID；同条件多票品通过含价格、数量和 ID 的下拉项明确选择；
+- 配置精确数量、连座、价格上限、查询间隔、通知和自动锁单；
+- 实时查看查询次数、最近价格、最低价格、可购数量、匹配原因、异常和锁单结果。
+
+票牛与摩天轮页面没有账号列表或账号切换入口。每个平台的所有任务共享 `PlatformRegistry` 中唯一的浏览器会话。登录、查询和清理都在后台 asyncio 线程执行，Tk 主线程只通过线程安全队列刷新界面。
+
+### 清理缓存
+
+顶部“清理缓存”按钮会先显示不可恢复的二次确认。确认后依次停止任务、取消查询/锁单协程、关闭两个浏览器和 Playwright，然后清理：
+
+- `data/browser_states/` 和 `data/browser_profiles/`；
+- SQLite 中的全部任务、运行快照、票价、匹配、锁单、通知和票务缓存；
+- `data/cache/`；
+- 项目内的 `.env` 和当前配置指定的购票档案私有文件。
+
+不会删除源代码、虚拟环境、依赖或 Playwright 浏览器程序。取消确认不会执行任何删除。
+
 ## Mock 演示
 
 `python main.py mock` 在没有 `config.yaml` 时自动读取 `config.example.yaml`，并执行四轮快速演示：
@@ -210,6 +253,8 @@ python main.py mock
 
 Mock 会使用控制台通知，不发送真实微信消息，也不打开浏览器。
 
+`python main.py gui --mock` 使用 `data/ticket_monitor_gui_mock.db`，可在桌面界面中同时启停票牛和摩天轮示例任务，不会污染正式数据库。
+
 ## 测试
 
 测试完全不依赖真实票务网站：
@@ -218,13 +263,14 @@ Mock 会使用控制台通知，不发送真实微信消息，也不打开浏览
 python -m pytest -q
 ```
 
-覆盖配置与私有档案、摩天轮严格数量、精确票品 ID、同名同价隔离、预检、最终金额保护、冷却重试、待支付幂等、支付按钮隔离和 Mock 端到端流程。
+覆盖配置与私有档案、GUI 初始化、SQLite 多任务保存/恢复/复制、单平台唯一会话、锁单优先门闩、多任务运行、缓存清理确认、后台线程关闭、完整业务日志与凭证过滤，以及摩天轮严格数量、精确票品 ID、预检、最终金额保护、待支付幂等和 Mock 端到端流程。
 
 ## 数据、日志与恢复
 
 - 数据库：`data/ticket_monitor.db`；
 - 登录 Storage State：`data/browser_states/<platform>_state.json`；
 - 持久化浏览器资料：`data/browser_profiles/<platform>/`；
+- 任务配置和票务缓存：`data/ticket_monitor.db` 中的 `monitor_tasks` 与 `ticket_cache`；
 - 轮转日志：`logs/ticket_monitor.log`。
 
 任务运行状态、连续异常、锁单阶段和历史会写入数据库。状态机为：`PREFLIGHT → WATCHING → MATCHED → REVALIDATING → SELECTING_QUANTITY → SELECTING_AUDIENCE → SELECTING_CONTACT → VERIFYING_FINAL_PRICE → READY_TO_SUBMIT → SUBMITTING → PAYMENT_PENDING`。
@@ -232,6 +278,8 @@ python -m pytest -q
 `success`、`payment_pending`、`order_exists` 永久阻止相同幂等键再次提交；`timeout`、`not_logged_in`、`out_of_stock`、`price_changed`、`page_changed`、`captcha_required`、`manual_profile_missing` 在冷却后允许重试。幂等键包含账号别名、平台、演出 ID、场次 ID、票品 ID 和数量。
 
 不要分享 `data/browser_states`、`data/browser_profiles`、`.env`、数据库或日志。它们可能包含账号会话或业务信息。
+
+业务日志会完整记录任务 ID/名称、演出链接和 ID、场次和 ID、票档和 ID、区域、票品 ID、数量、连座、价格上限、查询结果、不匹配原因、锁单阶段、订单页面与订单号。密码、完整 Cookie、Authorization、Token、Webhook、验证码、完整身份证号和支付凭证仍然会被过滤或禁止写入。
 
 ## 异常、频率与人工介入
 

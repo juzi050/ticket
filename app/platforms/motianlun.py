@@ -63,7 +63,8 @@ class MotianlunPlatform(TicketPlatform):
         await self.session.initialize()
 
     async def check_login_status(self) -> bool:
-        return await self.session.check_login_status()
+        async with self.normal_operation(), self._page_lock:
+            return await self.session.check_login_status()
 
     async def open_login_page(self) -> None:
         await self.session.open_login_page()
@@ -79,7 +80,7 @@ class MotianlunPlatform(TicketPlatform):
         }
 
     async def query_tickets(self, task: MonitorTask) -> Sequence[TicketInfo]:
-        async with self._page_lock:
+        async with self.normal_operation(), self._page_lock:
             page = await self._page()
             await self._goto_detail(page, task.event_url)
             sessions = await self._session_choices(page, task)
@@ -256,9 +257,11 @@ class MotianlunPlatform(TicketPlatform):
                     stage=LockStage.SELECTING_QUANTITY,
                 )
             except Exception as exc:
+                error_url = safe_page_url(page.url)
                 return LockOrderResult(
                     LockStatus.PAGE_CHANGED,
-                    f"摩天轮页面操作失败：{exc}",
+                    f"摩天轮页面操作失败：{exc}；错误页面：{error_url}",
+                    order_url=error_url,
                     failure_kind=FailureKind.RETRYABLE,
                 )
 
@@ -276,7 +279,9 @@ class MotianlunPlatform(TicketPlatform):
         try:
             await page.get_by_text("立即购买", exact=True).first.wait_for(state="visible")
         except Exception as exc:
-            raise PlatformError("摩天轮详情页结构已变化或演出不可购买") from exc
+            raise PlatformError(
+                f"摩天轮详情页结构已变化或演出不可购买；错误页面：{safe_page_url(page.url)}"
+            ) from exc
 
     async def _open_session_selector(self, page: Any) -> None:
         await page.get_by_text("立即购买", exact=True).first.click()

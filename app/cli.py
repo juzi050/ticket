@@ -8,7 +8,6 @@ from typing import Any
 from uuid import uuid4
 
 import typer
-import yaml
 from rich.console import Console
 from rich.table import Table
 
@@ -23,9 +22,26 @@ from app.services.monitor_service import MonitorService
 from app.services.notification_service import NotificationService
 from app.services.order_service import OrderService
 from app.services.preflight_service import PreflightService
+from app.storage.task_store import TaskStore
 
 app = typer.Typer(help="票务价格监控与锁单辅助系统", no_args_is_help=True, add_completion=False)
 console = Console()
+
+
+@app.command()
+def gui(
+    config: Path = typer.Option(Path("config.yaml"), "--config", help="全局设置文件"),
+    mock: bool = typer.Option(False, "--mock", help="使用 Mock 平台和独立演示数据库"),
+) -> None:
+    """启动 Tkinter 本地桌面软件。"""
+    setup_logging("INFO")
+    try:
+        from app.gui import launch_gui
+
+        launch_gui(config, mock_mode=mock)
+    except ConfigurationError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(2) from exc
 
 
 async def _discover_tickets(
@@ -69,6 +85,7 @@ async def _runtime(
     settings = load_settings(config, allow_example=mock_mode or allow_example)
     if mock_mode:
         settings.application.mock_mode = True
+        settings.application.database_path = Path("data/ticket_monitor_mock.db")
         settings.notification.provider = "console"
         settings.notification.enabled = True
         settings.login.check_interval_seconds = 0.01
@@ -80,12 +97,21 @@ async def _runtime(
             profile.account_alias = f"{profile.account_alias}-{run_alias}"
         for task in settings.tasks:
             task.enabled = True
-            task.interval_seconds = 0.05
+            task.interval_seconds = 1
             task.random_delay_min_seconds = 0
             task.random_delay_max_seconds = 0
     setup_logging(settings.application.log_level)
     database = Database(settings.application.database_path)
     await database.initialize()
+    stored_tasks = await database.load_tasks()
+    if stored_tasks:
+        settings.tasks = stored_tasks
+    elif await database.get_metadata("tasks_initialized") != "1":
+        for task in settings.tasks:
+            await database.upsert_task(task, "pending" if task.enabled else "paused")
+        await database.set_metadata("tasks_initialized", "1")
+    else:
+        settings.tasks = []
     notifier = build_notifier(settings.notification, mock_mode=mock_mode)
     notifications = NotificationService(notifier, database, settings.notification)
     login = LoginService(settings.login, notifications)
@@ -138,10 +164,23 @@ def run(
 def list_tasks(
     config: Path = typer.Option(Path("config.yaml"), "--config", help="配置文件路径")
 ) -> None:
-    """列出配置中的全部任务。"""
+    """列出 SQLite 中的全部任务。"""
     settings = _load_or_exit(config)
+
+    async def load_tasks_from_database() -> list[MonitorTask]:
+        database = Database(settings.application.database_path)
+        await database.initialize()
+        tasks = await database.load_tasks()
+        if tasks or await database.get_metadata("tasks_initialized") == "1":
+            return tasks
+        for task in settings.tasks:
+            await database.upsert_task(task, "pending" if task.enabled else "paused")
+        await database.set_metadata("tasks_initialized", "1")
+        return settings.tasks
+
+    tasks = asyncio.run(load_tasks_from_database())
     table = Table("任务编号", "启用", "平台", "演出", "自动锁单", "间隔(秒)")
-    for task in settings.tasks:
+    for task in tasks:
         table.add_row(
             task.task_id, "是" if task.enabled else "否", task.platform, task.event_name,
             "是" if task.auto_lock else "否", str(task.interval_seconds or settings.monitor.default_interval_seconds),
@@ -240,7 +279,7 @@ def discover(
 def create_task(
     config: Path = typer.Option(Path("config.yaml"), "--config"),
 ) -> None:
-    """交互发现并选择真实 ID，向现有配置追加一个任务。"""
+    """交互发现并选择真实 ID，将新任务保存到 SQLite。"""
     if not config.exists():
         console.print("[red]配置文件不存在，请先复制 config.example.yaml 为 config.yaml。[/red]")
         raise typer.Exit(2)
@@ -301,12 +340,11 @@ def create_task(
     if profile_index < 1 or profile_index > len(profile_ids):
         raise typer.BadParameter("购票档案序号无效")
 
-    raw = yaml.safe_load(config.read_text(encoding="utf-8")) or {}
-    tasks = raw.setdefault("tasks", [])
     task_id = typer.prompt("任务编号")
-    tasks.append(
+    task = MonitorTask.model_validate(
         {
             "task_id": task_id,
+            "task_name": task_id,
             "enabled": True,
             "platform": platform,
             "event_name": chosen.event_name,
@@ -325,8 +363,22 @@ def create_task(
             "purchase_profile_id": profile_ids[profile_index - 1],
         }
     )
-    config.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
-    console.print(f"[green]已追加任务 {task_id}。请核对价格上限并通过 preflight 后再启用 auto_lock。[/green]")
+
+    async def save_task() -> None:
+        database = Database(settings.application.database_path)
+        await database.initialize()
+        if await database.get_task(task_id):
+            raise ValueError(f"任务已存在：{task_id}")
+        await TaskStore(database).save(task)
+
+    try:
+        asyncio.run(save_task())
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(2) from exc
+    console.print(
+        f"[green]已将任务 {task_id} 保存到 SQLite。请核对价格上限并通过 preflight 后再启用 auto_lock。[/green]"
+    )
 
 
 @app.command("test-notification")
@@ -464,11 +516,12 @@ def _change_task_state(task_id: str, enabled: bool, config: Path) -> None:
         settings = load_settings(config)
         database = Database(settings.application.database_path)
         await database.initialize()
-        task = next((item for item in settings.tasks if item.task_id == task_id), None)
+        task = await database.get_task(task_id)
         if task is None:
             return False
-        await database.upsert_task(task)
-        return await database.set_task_enabled(task_id, enabled)
+        task.enabled = enabled
+        await TaskStore(database).save(task)
+        return True
 
     try:
         changed = asyncio.run(execute())

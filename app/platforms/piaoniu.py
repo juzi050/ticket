@@ -77,6 +77,10 @@ class PiaoniuPlatform(TicketPlatform):
         await self.session.initialize()
 
     async def check_login_status(self) -> bool:
+        async with self.normal_operation(), self._page_lock:
+            return await self._check_login_status_unlocked()
+
+    async def _check_login_status_unlocked(self) -> bool:
         page = await self.session.page()
         # 首页会通过 display 切换右上角的登录/用户入口。直接观察当前页，
         # 避免等待短信或图形验证码时反复刷新并关闭登录弹窗。
@@ -108,7 +112,7 @@ class PiaoniuPlatform(TicketPlatform):
         return {"event_id": event_id_from_url(task.event_url), "url": task.event_url}
 
     async def query_tickets(self, task: MonitorTask) -> Sequence[TicketInfo]:
-        async with self._page_lock:
+        async with self.normal_operation(), self._page_lock:
             page = await self.session.page()
             await self._goto_detail(page, task.event_url)
             sessions = await self._candidate_sessions(page, task)
@@ -261,9 +265,11 @@ class PiaoniuPlatform(TicketPlatform):
                     stage=LockStage.SUBMITTING,
                 )
             except Exception as exc:
+                error_url = safe_page_url(page.url)
                 return LockOrderResult(
                     LockStatus.PAGE_CHANGED,
-                    f"票牛页面操作失败：{exc}",
+                    f"票牛页面操作失败：{exc}；错误页面：{error_url}",
+                    order_url=error_url,
                     failure_kind=FailureKind.RETRYABLE,
                 )
 
@@ -275,7 +281,9 @@ class PiaoniuPlatform(TicketPlatform):
             interruption = await detect_interruption(page)
             if interruption:
                 raise PlatformError(interruption[1]) from exc
-            raise PlatformError("票牛详情页结构已变化或页面加载失败") from exc
+            raise PlatformError(
+                f"票牛详情页结构已变化或页面加载失败；错误页面：{safe_page_url(page.url)}"
+            ) from exc
 
     async def _candidate_sessions(self, page: Any, task: MonitorTask) -> list[dict[str, Any]]:
         normal = page.locator(".events-picker:not(.calendar-event-picker) .items .item:not(.disabled)")

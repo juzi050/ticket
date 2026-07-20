@@ -27,6 +27,21 @@ def _ticket_content(task: MonitorTask, ticket: TicketInfo) -> str:
     )
 
 
+def _task_log_content(task: MonitorTask) -> str:
+    return (
+        f"启动监控\n任务名称：{task.task_name}\n演出链接：{task.event_url}\n"
+        f"演出名称：{task.event_name}\n演出ID：{task.event_id}\n"
+        f"目标场次：{', '.join(task.target_sessions) or '不限'}\n场次ID：{task.target_session_id}\n"
+        f"演出日期：{task.event_date or '未单独限制'}\n演出时间：{task.event_time or '未单独限制'}\n"
+        f"目标票档：{', '.join(task.target_ticket_levels) or '不限'}\n"
+        f"票档ID：{task.target_ticket_level_id or task.target_ticket_group_id}\n"
+        f"目标区域：{', '.join(task.target_areas) or '不限'}\n票品ID：{task.target_listing_id}\n"
+        f"购买数量：{task.quantity}\n要求连座：{'是' if task.adjacent_seats_required else '否'}\n"
+        f"最高单价：{task.max_unit_price}\n最高总价：{task.max_total_price}\n"
+        f"查询间隔：{task.interval_seconds or '默认'}秒\n自动锁单：{'是' if task.auto_lock else '否'}"
+    )
+
+
 class MonitorService:
     def __init__(
         self,
@@ -65,7 +80,7 @@ class MonitorService:
         initial_min, initial_max = self._delay_range(task)
         if initial_max > 0:
             await asyncio.sleep(random.uniform(initial_min, initial_max))
-        logger.info("监控任务启动")
+        logger.info(_task_log_content(task))
         await self.database.update_task_state(task.task_id, "WATCHING")
         await self.database.record_lock_stage(
             f"task:{task.task_id}", task.task_id, LockStage.WATCHING, "监控任务启动"
@@ -93,9 +108,39 @@ class MonitorService:
                 logger.info("查询完成，共 %s 条", len(tickets))
                 for ticket in tickets:
                     await self.database.record_price(task.task_id, ticket)
+                    item_match = await platform.match_ticket(task, [ticket])
+                    logger.info(
+                        "查询到票品\n场次：%s\n场次ID：%s\n票档：%s\n票档ID：%s\n票品ID：%s\n"
+                        "区域：%s\n当前单价：%s\n当前总价：%s\n可购数量：%s\n连座：%s\n"
+                        "匹配结果：%s\n原因：%s",
+                        ticket.session_name,
+                        ticket.session_id,
+                        ticket.ticket_level,
+                        ticket.ticket_group_id or ticket.raw.get("category_id", ""),
+                        ticket.listing_id,
+                        ticket.area or "未提供",
+                        ticket.unit_price,
+                        ticket.payable_total,
+                        ticket.available_quantity,
+                        "是" if ticket.adjacent is True else "否" if ticket.adjacent is False else "未知",
+                        "匹配" if item_match.matched else "不匹配",
+                        "、".join(item_match.reasons) or "全部条件满足",
+                    )
                 result: MatchResult = await platform.match_ticket(task, tickets)
                 errors = 0
-                await self.database.update_task_state(task.task_id, "WATCHING", last_run=True)
+                snapshot_ticket = result.ticket or (min(tickets, key=lambda item: item.payable_total) if tickets else None)
+                await self.database.update_task_snapshot(
+                    task.task_id,
+                    status="发现目标票" if result.matched else "未发现目标票",
+                    query_increment=True,
+                    last_price=snapshot_ticket.unit_price if snapshot_ticket else None,
+                    available_quantity=snapshot_ticket.available_quantity if snapshot_ticket else None,
+                    ticket_level=snapshot_ticket.ticket_level if snapshot_ticket else None,
+                    area=snapshot_ticket.area if snapshot_ticket else None,
+                    matched=result.matched,
+                    mismatch_reason=None if result.matched else "、".join(result.reasons),
+                    error=None,
+                )
                 if result.matched and result.ticket is not None:
                     ticket = result.ticket
                     await self.database.update_task_state(task.task_id, "MATCHED", last_run=True)
@@ -109,13 +154,50 @@ class MonitorService:
                             NotificationMessage("ticket_found", "发现符合条件的票", _ticket_content(task, ticket))
                         )
                     if task.auto_lock:
+                        if task.notify:
+                            self.notifications.dispatch(
+                                NotificationMessage(
+                                    "lock_started",
+                                    "开始锁单",
+                                    f"任务：{task.task_name}\n平台：{task.platform}\n演出：{ticket.event_name}\n"
+                                    f"场次：{ticket.session_name}\n票档：{ticket.ticket_level}\n数量：{task.quantity}",
+                                )
+                            )
                         lock_result = await self.order_service.lock(task, ticket, platform)
-                        logger.info("锁单结果：%s - %s", lock_result.status.value, lock_result.message)
+                        logger.info(
+                            "锁单结果：%s\n原因：%s\n订单页面：%s\n订单号：%s\n最终金额：%s",
+                            lock_result.status.value,
+                            lock_result.message,
+                            lock_result.order_url or "无",
+                            lock_result.order_id or "无",
+                            lock_result.final_total if lock_result.final_total is not None else "未知",
+                        )
+                        await self.database.update_task_snapshot(
+                            task.task_id,
+                            status=("已进入待支付" if lock_result.success else "需要人工处理" if lock_result.requires_manual_action else "锁单失败"),
+                            lock_result=f"{lock_result.status.value}: {lock_result.message}",
+                        )
+                        if lock_result.requires_manual_action and not lock_result.success:
+                            session = getattr(platform, "session", None)
+                            if session is not None:
+                                try:
+                                    page = await session.page()
+                                    await page.bring_to_front()
+                                except Exception:
+                                    logger.warning("需要人工处理，但浏览器窗口切换到前台失败", exc_info=True)
+                            await self.database.set_task_enabled(task.task_id, False)
+                            await self.database.update_task_snapshot(
+                                task.task_id, status="需要人工处理"
+                            )
                         if task.notify:
                             self.notifications.dispatch(
                                 NotificationMessage(
                                     "lock_result",
-                                    "锁单成功，请手动付款" if lock_result.success else "锁单未成功",
+                                    "锁单成功，请手动付款"
+                                    if lock_result.success
+                                    else "需要人工处理"
+                                    if lock_result.requires_manual_action
+                                    else "锁单未成功",
                                     (
                                         f"平台：{ticket.platform}\n任务：{task.task_id}\n演出：{ticket.event_name}\n"
                                         f"状态：{lock_result.status.value}\n原因：{lock_result.message}\n"
@@ -127,6 +209,9 @@ class MonitorService:
                                     ),
                                 )
                             )
+                        if lock_result.requires_manual_action and not lock_result.success:
+                            logger.info("任务因需要人工处理而暂停")
+                            return
                         if lock_result.success and task.stop_after_lock_success:
                             await self.database.update_task_state(task.task_id, "completed", last_run=True)
                             logger.info("锁单成功，按配置停止任务")
@@ -136,6 +221,7 @@ class MonitorService:
             except LoginRequiredError:
                 errors += 1
                 await self.database.update_task_state(task.task_id, "waiting_login", consecutive_errors=errors)
+                await self.database.update_task_snapshot(task.task_id, status="正在检查登录", error="登录状态失效")
             except AdapterNotImplementedError as exc:
                 logger.error("真实平台适配尚未完成：%s", exc)
                 await self.database.update_task_state(task.task_id, "adapter_unavailable", consecutive_errors=errors)
@@ -162,6 +248,9 @@ class MonitorService:
             except Exception as exc:
                 errors += 1
                 logger.exception("任务第 %s 次连续异常：%s", errors, exc)
+                await self.database.update_task_snapshot(
+                    task.task_id, status="发生异常", error=str(exc)
+                )
                 threshold = task.max_consecutive_errors or self.settings.max_consecutive_errors
                 await self.database.update_task_state(task.task_id, "error", consecutive_errors=errors, last_run=True)
                 if errors == threshold:
@@ -180,5 +269,7 @@ class MonitorService:
             threshold = task.max_consecutive_errors or self.settings.max_consecutive_errors
             if errors > 0:
                 base_interval = min(base_interval * (2 ** min(errors, 4)), 300)
+            if max_cycles is not None:
+                base_interval = min(base_interval, 0.05)
             delay_min, delay_max = self._delay_range(task)
             await asyncio.sleep(base_interval + random.uniform(delay_min, delay_max))

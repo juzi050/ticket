@@ -8,7 +8,14 @@ from pathlib import Path
 
 class ContextAndSensitiveFilter(logging.Filter):
     _patterns = (
-        (re.compile(r"(?i)(token|sendkey|cookie|password|webhook)(\s*[=:]\s*)[^\s,;]+"), r"\1\2***"),
+        (
+            re.compile(
+                r"(?i)(token|sendkey|cookie|password|authorization|api[_-]?key|secret|"
+                r"payment[_-]?(?:token|password)|card[_-]?(?:number|no)|验证码|银行卡号|支付密码)"
+                r"(\s*[=:]\s*)[^\s,;]+"
+            ),
+            r"\1\2***",
+        ),
         (re.compile(r"https://[^\s]+(?:webhook|send)[^\s]+", re.I), "https://***"),
         (re.compile(r"(?<!\d)(1\d{2})\d{4}(\d{4})(?!\d)"), r"\1****\2"),
         (re.compile(r"(?<!\d)(\d{6})\d{8}(\d{4}[0-9Xx])(?!\d)"), r"\1********\2"),

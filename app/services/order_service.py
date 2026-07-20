@@ -75,7 +75,16 @@ class OrderService:
             return FailureKind.MANUAL_ACTION
         return FailureKind.NON_RETRYABLE
 
-    async def lock(self, task: MonitorTask, ticket: TicketInfo, platform: TicketPlatform) -> LockOrderResult:
+    async def lock(
+        self, task: MonitorTask, ticket: TicketInfo, platform: TicketPlatform
+    ) -> LockOrderResult:
+        await self.database.update_task_snapshot(task.task_id, status="等待平台操作锁")
+        async with platform.priority_operation():
+            return await self._lock_impl(task, ticket, platform)
+
+    async def _lock_impl(
+        self, task: MonitorTask, ticket: TicketInfo, platform: TicketPlatform
+    ) -> LockOrderResult:
         async with self._lock_for(task.task_id):
             profile = self.purchase_profiles.get(task.purchase_profile_id)
             if profile is None:
@@ -110,6 +119,18 @@ class OrderService:
                     "task=%s lock_stage=%s %s", task.task_id, stage.value, message
                 )
                 await self.database.record_lock_stage(key, task.task_id, stage, message)
+                status = {
+                    LockStage.PREFLIGHT: "正在重新校验",
+                    LockStage.REVALIDATING: "正在重新校验",
+                    LockStage.SELECTING_QUANTITY: "正在锁单",
+                    LockStage.SELECTING_AUDIENCE: "正在锁单",
+                    LockStage.SELECTING_CONTACT: "正在锁单",
+                    LockStage.VERIFYING_FINAL_PRICE: "正在锁单",
+                    LockStage.READY_TO_SUBMIT: "正在锁单",
+                    LockStage.SUBMITTING: "正在锁单",
+                    LockStage.PAYMENT_PENDING: "已进入待支付",
+                }[stage]
+                await self.database.update_task_snapshot(task.task_id, status=status)
 
             await transition(LockStage.PREFLIGHT, "开始锁单前校验")
             if not await platform.check_login_status():

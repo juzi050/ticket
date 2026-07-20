@@ -71,10 +71,11 @@ class MockPlatform(TicketPlatform):
         )
 
     async def query_tickets(self, task: MonitorTask) -> Sequence[TicketInfo]:
-        await asyncio.sleep(0)
-        self.query_counts[task.task_id] += 1
-        # 前两轮不满足价格/数量，第三轮开始出现目标票。
-        return [self._ticket(task, good=self.query_counts[task.task_id] >= 3)]
+        async with self.normal_operation():
+            await asyncio.sleep(0)
+            self.query_counts[task.task_id] += 1
+            # 前两轮不满足价格/数量，第三轮开始出现目标票。
+            return [self._ticket(task, good=self.query_counts[task.task_id] >= 3)]
 
     async def preflight_tickets(self, task: MonitorTask) -> Sequence[TicketInfo]:
         return [self._ticket(task, good=True)]

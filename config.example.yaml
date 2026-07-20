@@ -64,6 +64,7 @@ platforms:
 
 tasks:
   - task_id: piaoniu_001
+    task_name: 票牛示例双人任务
     enabled: true
     platform: piaoniu
     event_name: 示例演唱会
@@ -106,6 +107,7 @@ tasks:
     purchase_profile_id: example_two_people
 
   - task_id: piaoniu_002
+    task_name: 票牛示例单人通知
     enabled: true
     platform: piaoniu
     event_name: 示例演唱会第二场
@@ -130,6 +132,7 @@ tasks:
     purchase_profile_id: example_one_person
 
   - task_id: motianlun_001
+    task_name: 摩天轮示例双人任务
     enabled: true
     platform: motianlun
     event_name: 示例音乐节

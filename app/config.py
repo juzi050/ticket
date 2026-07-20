@@ -132,6 +132,7 @@ class MonitorTask(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     task_id: str = Field(min_length=1)
+    task_name: str = ""
     enabled: bool = True
     platform: Literal["piaoniu", "motianlun", "mock"]
     event_name: str = Field(min_length=1)
@@ -140,6 +141,7 @@ class MonitorTask(BaseModel):
     target_session_id: str = ""
     target_listing_id: str = ""
     target_ticket_group_id: str = ""
+    target_ticket_level_id: str = ""
     target_sessions: list[str] = Field(default_factory=list)
     event_date: str | None = None
     event_time: str | None = None
@@ -186,6 +188,8 @@ class MonitorTask(BaseModel):
 
     @model_validator(mode="after")
     def validate_ranges_and_prices(self) -> "MonitorTask":
+        if not self.task_name:
+            self.task_name = self.task_id
         if self.row_min is not None and self.row_max is not None and self.row_max < self.row_min:
             raise ValueError("row_max 不能小于 row_min")
         if self.seat_min is not None and self.seat_max is not None and self.seat_max < self.seat_min:
@@ -243,6 +247,7 @@ def load_settings(path: str | Path = "config.yaml", *, allow_example: bool = Fal
             profile_raw = yaml.safe_load(profiles_file.read_text(encoding="utf-8")) or {}
             raw["purchase_profiles"] = profile_raw.get("purchase_profiles", profile_raw.get("profiles", []))
         settings = Settings.model_validate(raw)
+        settings.purchase_profiles_file = profiles_file.resolve()
     except yaml.YAMLError as exc:
         raise ConfigurationError(f"YAML 格式错误：{exc}") from exc
     except ValidationError as exc:
