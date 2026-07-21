@@ -1,0 +1,20 @@
+[Unit]
+Description=Ticket price monitor
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ticketmon
+Group=ticketmon
+WorkingDirectory=/opt/ticket-monitor
+ExecStart=/opt/ticket-monitor/.venv/bin/python -m app.headless
+Restart=on-failure
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=Asia/Shanghai
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

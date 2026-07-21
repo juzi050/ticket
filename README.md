@@ -1,6 +1,6 @@
 # 票务监控桌面程序
 
-这是当前唯一版本的本地 Tkinter 票务监控程序，支持票牛和摩天轮：
+这是当前版本的票务监控程序，支持本地 Tkinter 图形界面和服务器无界面常驻运行：
 
 - 在 GUI 中登录两个平台并保存本地登录态；
 - 管理本地购票人以及每个任务使用的购票人；
@@ -22,7 +22,7 @@ Set-Location D:\tools\ticket
 .\.venv\Scripts\python.exe main.py
 ```
 
-现在只有这一个启动方式，不再接受 `gui`、`mock`、`run` 等旧 CLI 参数。
+本地图形界面只有这一个启动方式，不再接受 `gui`、`mock`、`run` 等旧 CLI 参数。
 
 如果还没有虚拟环境：
 
@@ -32,6 +32,16 @@ py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe main.py
 ```
+
+服务器使用无界面入口：
+
+```bash
+python -m app.headless
+```
+
+服务器入口读取与 GUI 完全相同的 SQLite 数据库、平台登录态、监控任务和
+Server酱配置，不会打开登录窗口。登录失效后应在本地 GUI 重新登录，再更新
+服务器上的数据库。
 
 ## 配置
 
@@ -73,6 +83,9 @@ SERVERCHAN_SENDKEY=
 .
 ├── main.py
 ├── requirements.txt
+├── requirements-server.txt
+├── deploy/
+│   └── ticket-monitor.service
 ├── .env.example
 ├── app/
 │   ├── auth/                 # Playwright 登录与 HTTP 会话转换
@@ -82,6 +95,7 @@ SERVERCHAN_SENDKEY=
 │   ├── services/             # 价格监控与订单协调
 │   ├── storage/              # SQLite 仓储与审计
 │   ├── domain.py
+│   ├── headless.py
 │   ├── monitor_scheduler.py
 │   └── settings.py
 ├── data/
