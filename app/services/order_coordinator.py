@@ -41,7 +41,31 @@ class OrderCoordinator:
     ) -> OrderResult | None:
         lock = self._locks.setdefault(task.ticket.platform, asyncio.Lock())
         async with lock:
+            api = self.apis[task.ticket.platform]
             blocking = await self.orders.find_blocking(task)
+            blocking_result = blocking.result if blocking else None
+            if blocking and blocking.status == "payment_pending" and blocking.order_id:
+                try:
+                    latest = await api.get_order_detail(blocking.order_id)
+                    await self.orders.save_result(build_idempotency_key(task), latest)
+                    if latest.status != "payment_pending":
+                        blocking = None
+                    else:
+                        blocking_result = latest
+                except Exception as exc:
+                    await self.audit.append(
+                        AuditEntry(
+                            level="WARNING",
+                            category="order",
+                            action="blocking_order_refresh_failed",
+                            platform=task.ticket.platform,
+                            task_id=task.task_id,
+                            order_id=blocking.order_id,
+                            message="无法确认已有待支付订单状态，继续阻止重复下单",
+                            exception_type=type(exc).__name__,
+                            exception_message=str(exc),
+                        )
+                    )
             if blocking:
                 await self.audit.append(
                     AuditEntry(
@@ -56,9 +80,8 @@ class OrderCoordinator:
                     )
                 )
                 await self.tasks.set_enabled(task.task_id, False, blocking.status)
-                return blocking.result
+                return blocking_result
 
-            api = self.apis[task.ticket.platform]
             current_ticket = await api.get_exact_ticket(task.ticket, task.quantity)
             if current_ticket is None:
                 await self.tasks.update_runtime(

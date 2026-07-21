@@ -148,3 +148,93 @@ async def test_platform_pending_order_wins_over_concurrent_empty_local_claim() -
 
     assert result == pending
     api.create_order.assert_not_awaited()
+
+
+async def test_closed_local_pending_order_no_longer_blocks_monitor() -> None:
+    current = ticket()
+    monitor_task = task(current)
+    pending = OrderResult(
+        success=True,
+        status="payment_pending",
+        order_id="order-1",
+        message="待支付",
+    )
+    closed = OrderResult(
+        success=False,
+        status="closed",
+        order_id="order-1",
+        message="已关闭",
+    )
+    api = Mock(
+        get_order_detail=AsyncMock(return_value=closed),
+        get_exact_ticket=AsyncMock(return_value=None),
+    )
+    tasks = Mock(update_runtime=AsyncMock(), set_enabled=AsyncMock())
+    orders = Mock(
+        find_blocking=AsyncMock(
+            return_value=SimpleNamespace(
+                status="payment_pending", order_id="order-1", result=pending
+            )
+        ),
+        save_result=AsyncMock(),
+    )
+    coordinator = OrderCoordinator(
+        {"motianlun": api},
+        Mock(),
+        tasks,
+        orders,
+        Mock(append=AsyncMock()),
+        Mock(),
+    )
+
+    result = await coordinator.handle_price_match(monitor_task, current)
+
+    assert result is None
+    orders.save_result.assert_awaited_once_with(
+        build_idempotency_key(monitor_task), closed
+    )
+    api.get_exact_ticket.assert_awaited_once_with(current, 1)
+    tasks.set_enabled.assert_not_awaited()
+
+
+async def test_current_local_pending_order_still_blocks_duplicate() -> None:
+    current = ticket()
+    monitor_task = task(current)
+    pending = OrderResult(
+        success=True,
+        status="payment_pending",
+        order_id="order-1",
+        message="待支付",
+    )
+    api = Mock(
+        get_order_detail=AsyncMock(return_value=pending),
+        get_exact_ticket=AsyncMock(),
+    )
+    tasks = Mock(update_runtime=AsyncMock(), set_enabled=AsyncMock())
+    orders = Mock(
+        find_blocking=AsyncMock(
+            return_value=SimpleNamespace(
+                status="payment_pending", order_id="order-1", result=pending
+            )
+        ),
+        save_result=AsyncMock(),
+    )
+    coordinator = OrderCoordinator(
+        {"motianlun": api},
+        Mock(),
+        tasks,
+        orders,
+        Mock(append=AsyncMock()),
+        Mock(),
+    )
+
+    result = await coordinator.handle_price_match(monitor_task, current)
+
+    assert result == pending
+    orders.save_result.assert_awaited_once_with(
+        build_idempotency_key(monitor_task), pending
+    )
+    api.get_exact_ticket.assert_not_awaited()
+    tasks.set_enabled.assert_awaited_once_with(
+        monitor_task.task_id, False, "payment_pending"
+    )
