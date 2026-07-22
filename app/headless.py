@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import signal
+from datetime import timedelta
 
 import httpx
 
 from app.auth.session_bridge import AuthSessionBridge
-from app.domain import PlatformName
+from app.domain import PlatformName, utc_now
 from app.monitor_scheduler import MonitorScheduler
 from app.notifications import ServerChanNotifier
 from app.platforms.http_api import TicketPlatformApi
@@ -26,6 +27,8 @@ from app.storage.task_repository import TaskRepository
 
 LOGGER = logging.getLogger(__name__)
 API_TYPES = {"piaoniu": PiaoniuApi, "motianlun": MotianlunApi}
+AUDIT_RETENTION = timedelta(hours=24)
+AUDIT_CLEANUP_INTERVAL_SECONDS = 3600
 
 
 class HeadlessApplication:
@@ -44,12 +47,14 @@ class HeadlessApplication:
         self.apis: dict[PlatformName, TicketPlatformApi] = {}
         self.notifier: ServerChanNotifier | None = None
         self.scheduler: MonitorScheduler | None = None
+        self._cleanup_task: asyncio.Task[None] | None = None
         self._started = False
 
     async def start(self) -> None:
         if self._started:
             return
         await self.database.initialize()
+        await self._cleanup_audit_logs()
         self.apis = await self._create_apis()
         self.notifier = ServerChanNotifier(
             self.audit, sendkey=self.settings.serverchan_sendkey
@@ -78,12 +83,19 @@ class HeadlessApplication:
             )
         )
         await self.scheduler.start()
+        self._cleanup_task = asyncio.create_task(
+            self._run_audit_cleanup(), name="audit-retention"
+        )
         self._started = True
         LOGGER.info("服务器监控程序已启动")
 
     async def close(self) -> None:
         if self.scheduler is not None:
             await self.scheduler.stop()
+        if self._cleanup_task is not None:
+            self._cleanup_task.cancel()
+            await asyncio.gather(self._cleanup_task, return_exceptions=True)
+            self._cleanup_task = None
         if self._started:
             await self.audit.append(
                 AuditEntry(
@@ -99,6 +111,28 @@ class HeadlessApplication:
             await api.close()
         self._started = False
         LOGGER.info("服务器监控程序已停止")
+
+    async def _run_audit_cleanup(self) -> None:
+        while True:
+            await asyncio.sleep(AUDIT_CLEANUP_INTERVAL_SECONDS)
+            try:
+                await self._cleanup_audit_logs()
+            except Exception:
+                LOGGER.exception("清理过期审计日志失败")
+
+    async def _cleanup_audit_logs(self) -> int:
+        deleted = await self.audit.delete_before(utc_now() - AUDIT_RETENTION)
+        await self.audit.append(
+            AuditEntry(
+                level="INFO",
+                category="maintenance",
+                action="audit_retention_cleanup",
+                message=f"已清理 {deleted} 条超过24小时的审计日志",
+                context={"deleted_count": deleted, "retention_hours": 24},
+            )
+        )
+        LOGGER.info("已清理 %s 条超过24小时的审计日志", deleted)
+        return deleted
 
     async def _create_apis(self) -> dict[PlatformName, TicketPlatformApi]:
         result: dict[PlatformName, TicketPlatformApi] = {}
@@ -143,6 +177,8 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     asyncio.run(run())
 
 

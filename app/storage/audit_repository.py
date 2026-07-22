@@ -222,6 +222,15 @@ class AuditRepository:
             await connection.commit()
             return max(cursor.rowcount, 0)
 
+    async def delete_before(self, cutoff: datetime) -> int:
+        async with self.database.connect() as connection:
+            cursor = await connection.execute(
+                "DELETE FROM audit_logs WHERE timestamp < ?",
+                (cutoff.isoformat(),),
+            )
+            await connection.commit()
+            return max(cursor.rowcount, 0)
+
     @staticmethod
     def _json(value: Any) -> str | None:
         if value is None:

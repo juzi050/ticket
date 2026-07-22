@@ -1,5 +1,8 @@
 import csv
 import json
+from datetime import timedelta
+
+from app.domain import utc_now
 
 from app.storage.audit_repository import (
     REDACTED,
@@ -94,3 +97,30 @@ async def test_export_audit_logs_as_json_and_csv(tmp_path) -> None:
 
     assert await repository.clear() == 1
     assert await repository.query() == []
+
+
+async def test_delete_audit_logs_before_cutoff(tmp_path) -> None:
+    database = MvpDatabase(tmp_path / "ticket.db")
+    await database.initialize()
+    repository = AuditRepository(database)
+    await repository.append(
+        AuditEntry(
+            level="INFO",
+            category="monitor",
+            action="old",
+            message="过期日志",
+            timestamp=utc_now() - timedelta(hours=25),
+        )
+    )
+    await repository.append(
+        AuditEntry(
+            level="INFO",
+            category="monitor",
+            action="current",
+            message="当前日志",
+        )
+    )
+
+    assert await repository.delete_before(utc_now() - timedelta(hours=24)) == 1
+    rows = await repository.query()
+    assert [row.action for row in rows] == ["current"]
